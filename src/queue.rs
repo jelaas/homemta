@@ -4,7 +4,7 @@
 //! a blank line, then the CRLF-normalized message. Files are written
 //! atomically (temp file + rename).
 //!
-//! Retry schedule follows the reference exim.conf:
+//! Retry schedule (the classic F/G rule set):
 //!   F,2h,15m; G,16h,1h,1.5; F,4d,6h
 //! i.e. every 15 minutes for the first 2 hours, then geometrically growing
 //! intervals (1h, 1.5h, ... capped at 16h) until 4 days after the first

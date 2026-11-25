@@ -3,8 +3,8 @@
 //! STARTTLS when a certificate is configured, and routes:
 //!   - local domains  -> /etc/aliases, ~/.forward, mbox delivery
 //!   - everything else -> smarthost queue
-//! Implements the checks from the reference exim.conf ACLs (restricted local
-//! parts, postmaster acceptance, submission fixes for Date/Message-ID/From).
+//! Implements the classic ACL checks (restricted local parts, postmaster
+//! acceptance, submission fixes for Date/Message-ID/From).
 
 use crate::address::{self};
 use crate::bounce::{self, Failure};
@@ -34,7 +34,7 @@ fn random_seed() -> u64 {
     seed ^ ((log::unix_now() as u64) << 32) ^ (std::process::id() as u64)
 }
 
-/// Exim-style message id: <E<timehex><random>@hostname>
+/// Classic message id: <E<timehex><random>@hostname>
 pub fn message_id(host: &str) -> String {
     if RANDOM_SEED.load(Ordering::Relaxed) == 0 {
         RANDOM_SEED.store(random_seed(), Ordering::Relaxed);
@@ -316,7 +316,7 @@ impl Session {
             }
         };
         let is_local = self.cfg.is_local_domain(&addr.domain);
-        // exim ACL restricted-character checks.
+        // ACL restricted-character checks.
         if is_local && address::restricted_local(&addr.local) {
             self.reply(550, "Restricted characters in address");
             return;

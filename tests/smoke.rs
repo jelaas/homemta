@@ -500,7 +500,22 @@ impl Drop for Mta {
         // Signal-based shutdown (kill) may be unavailable in sandboxes
         // where the kill syscall is blocked.
         drop(self.stdin.take());
-        let _ = self.child.wait();
+        // Bounded wait: the MTA exits on stdin EOF; if some fd leak keeps
+        // the pipe open, give up after 10s instead of hanging the suite.
+        let pid = self.child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut st = 0;
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if r == pid || r == -1 {
+                return;
+            }
+            if Instant::now() > deadline {
+                eprintln!("[trace] Mta::drop: MTA {} did not exit in time, abandoning", pid);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -527,6 +542,55 @@ fn can_setuid() -> bool {
     })
 }
 
+/// Close every fd except 0/1/2. Used in post-fork probe children so they
+/// never keep the parent's pipe ends (or sockets) open - a leaked fork
+/// child must not hold other tests' stdin pipes or the harness output.
+fn close_extra_fds() {
+    unsafe {
+        // close_range syscall (Linux 5.9+, x86_64 syscall 436); ignore
+        // failure and fall back to a plain loop for older kernels.
+        let _ = libc::syscall(436, 3u32, u32::MAX, 0u32);
+        for fd in 3..1024 {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Can this test environment kill processes? Needed to clean up a
+/// daemonized instance; some sandboxes block the kill syscall.
+fn can_kill() -> bool {
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN.get_or_init(|| unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            // child: drop inherited fds, wait forever until killed.
+            close_extra_fds();
+            let null =
+                libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            if null >= 0 {
+                libc::dup2(null, 0);
+                libc::dup2(null, 1);
+                libc::dup2(null, 2);
+                if null > 2 {
+                    libc::close(null);
+                }
+            }
+            loop {
+                libc::pause();
+            }
+        }
+        if pid < 0 {
+            return false;
+        }
+        let ok = libc::kill(pid, libc::SIGKILL) == 0;
+        if ok {
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
+        }
+        ok
+    })
+}
+
 fn start_mta(
     smarthost_port: Option<u16>,
     relay_from_hosts: &[&str],
@@ -535,6 +599,7 @@ fn start_mta(
     ca_file: &Path,
     cert_file: &Path,
     key_file: &Path,
+    extra_args: &[&str],
 ) -> Mta {
     // Pick a free port so parallel tests never collide.
     let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -638,6 +703,7 @@ fn start_mta(
         .arg(&cfg_path)
         .arg("--exit-on-stdin-eof")
         .arg("-d")
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -747,6 +813,7 @@ fn end_to_end_local_remote_starttls_and_auth() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     // Unknown local user must be rejected.
@@ -778,7 +845,7 @@ fn end_to_end_local_remote_starttls_and_auth() {
     );
     assert_eq!(code, 250, "submission failed: {:?}", reply);
 
-    // Local mbox: exim/dovecot format.
+    // Local mbox: traditional BSD mailbox format.
     wait_for("local mbox delivery", || {
         mbox_content(&mta, "testuser").contains("Subject: e2e test")
     });
@@ -836,6 +903,7 @@ fn remote_failure_bounces_to_local_sender() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, reply) = smtp_submit(
@@ -878,6 +946,7 @@ fn temporary_failure_is_retried() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, _) = smtp_submit(
@@ -915,6 +984,7 @@ fn alias_pipe_delivery() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, reply) = smtp_submit(
@@ -947,6 +1017,7 @@ fn remote_rejected_when_no_smarthost() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
     let (code, _) = smtp_submit(
         mta.port,
@@ -989,6 +1060,7 @@ fn inbound_mx_accepts_local_rejects_relay() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     // Mail to a local user must be accepted and delivered.
@@ -1036,7 +1108,7 @@ fn inbound_mx_accepts_local_rejects_relay() {
     assert_eq!(code, 550);
 }
 
-/// relay_from_hosts supports CIDR ranges (exim-style host lists).
+/// relay_from_hosts supports CIDR ranges.
 #[test]
 fn relay_cidr_allows_submission() {
     let c = setup();
@@ -1051,6 +1123,7 @@ fn relay_cidr_allows_submission() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, reply) = smtp_submit(
@@ -1082,6 +1155,7 @@ fn smarthost_auth_cram_md5() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, _) = smtp_submit(
@@ -1115,6 +1189,7 @@ fn smarthost_auth_mismatch_bounces() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
 
     let (code, _) = smtp_submit(
@@ -1148,6 +1223,7 @@ fn never_users_forbids_root_delivery() {
         &c.ca_file,
         &c.cert_file,
         &c.key_file,
+        &[],
     );
     // Drop the postmaster alias so postmaster resolves to root.
     std::fs::write(mta.dir.join("aliases"), "").unwrap();
@@ -1169,4 +1245,79 @@ fn never_users_forbids_root_delivery() {
     let mbox = mbox_content(&mta, "testuser");
     assert!(mbox.contains("Final-Recipient: rfc822; postmaster@test.example"));
     assert!(mbox.contains("never_users"), "bounce must mention never_users: {}", mbox);
+}
+
+/// Daemon mode (-b): the launcher exits immediately, the daemon detaches
+/// (reparented to init), serves mail, writes and removes its pid file.
+#[test]
+fn daemon_mode_serves_and_writes_pidfile() {
+    let c = setup();
+    let roots = client_roots(&c.ca);
+    let state = Arc::new(Mutex::new(SmarthostState::default()));
+    let (smarthost_port, _sm) = start_smarthost(state.clone(), &["PLAIN"], &c.ca, &c.ca_key);
+
+    let pid_dir = std::env::temp_dir().join(format!(
+        "homemta-daemon-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    let pidfile = pid_dir.join("homemta.pid");
+    let pidfile_s = pidfile.to_str().unwrap().to_string();
+
+    let mta = start_mta(
+        Some(smarthost_port),
+        &["127.0.0.1"],
+        "auto",
+        "",
+        &c.ca_file,
+        &c.cert_file,
+        &c.key_file,
+        &["--daemon", "--pidfile", &pidfile_s],
+    );
+
+    // The daemon writes its pid file after binding.
+    wait_for("pidfile", || pidfile.exists());
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    assert!(pid > 1);
+    assert!(unsafe { libc::kill(pid, 0) } == 0, "daemon pid {} not alive", pid);
+
+    // Detached: the daemon must have been reparented to init (ppid 1).
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap();
+    let ppid: i32 = stat
+        .split_whitespace()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1);
+    assert_eq!(ppid, 1, "daemon should be reparented to init");
+
+    // It serves mail normally.
+    let (code, reply) = smtp_submit(
+        mta.port,
+        false,
+        &roots,
+        "testuser@test.example",
+        &["testuser@test.example"],
+        &["Subject: via daemon", "", "body"],
+    );
+    assert_eq!(code, 250, "submission failed: {:?}", reply);
+    wait_for("daemon local delivery", || {
+        mbox_content(&mta, "testuser").contains("Subject: via daemon")
+    });
+
+    // SIGTERM -> graceful shutdown, pid file removed. Where signals are
+    // unavailable (some sandboxes block kill(2)), the detached daemon is
+    // left running; its stdio is detached so the harness is unaffected.
+    if can_kill() {
+        assert!(unsafe { libc::kill(pid, libc::SIGTERM) } == 0);
+        wait_for("daemon exit", || unsafe {
+            libc::kill(pid, 0) == -1 && *libc::__errno_location() == libc::ESRCH
+        });
+        assert!(!pidfile.exists(), "pid file must be removed on shutdown");
+    } else {
+        eprintln!("daemon test: signals unavailable, leaving daemon {} running", pid);
+    }
 }

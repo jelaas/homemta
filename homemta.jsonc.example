@@ -9,20 +9,21 @@
   // mailbox_dir). "@" means the primary hostname.
   "local_domains": ["@"],
 
-  // Hosts allowed to submit mail to ANY domain (exim.conf:
-  // relay_from_hosts). Exact IPv4 addresses or CIDR ranges. Everyone else
-  // may only send to local_domains - there is no open relaying.
+  // Trusted hosts allowed to submit mail to ANY domain. Exact IPv4
+  // addresses or CIDR ranges. Everyone else may only send to
+  // local_domains - there is no open relaying.
   "relay_from_hosts": ["127.0.0.1"],
 
-  // Inbound listener. 0.0.0.0:25 to receive mail from the internet (like
-  // exim), or 127.0.0.1 for submission-only setups.
+  // Inbound listener. 0.0.0.0:25 to receive mail from the internet, or
+  // 127.0.0.1 for submission-only setups.
   "listen_addr": "0.0.0.0",
   "listen_ports": [25],
 
   // Spool (outgoing queue).
   "spool_dir": "/var/spool/homemta",
 
-  // Local mailboxes: one mbox file per user, exim/dovecot compatible.
+  // Local mailboxes: one mbox file per user, in the traditional BSD
+  // mailbox format that Dovecot reads.
   "mailbox_dir": "/var/spool/mail",
 
   // Lookup files. Format matches /etc/aliases, /etc/passwd, /etc/group.
@@ -31,6 +32,9 @@
   "group_file": "/etc/group",
 
   "log_file": "/var/log/homemta.log",
+  // Optional: write the daemon's pid here (init scripts). Also settable
+  // with --pidfile. Written after startup, removed on clean shutdown.
+  //"pid_file": "/run/homemta.pid",
 
   // Maximum accepted message size (bytes, or "K"/"M"/"G" suffix).
   "max_message_size": "64M",
@@ -67,15 +71,15 @@
   },
 
   // Privilege separation: the daemon binds port 25 as root, then drops to
-  // this user (exim's "exim" user equivalent). Use "root" only for
-  // containers or debugging.
+  // this user (the classic "mail" user). Use "root" only for containers
+  // or debugging.
   "user": "mail",
   // Optional group (defaults to the user's primary group).
   //"group": "mail",
   // Setuid-root helper that appends to user-owned mailboxes. Install with:
   //   install -m4755 -o root -g root homemta /usr/local/libexec/homemta-deliver
   "deliver_helper": "/usr/local/libexec/homemta-deliver",
-  // Never run a delivery as these users (exim.conf: never_users = root).
+  // Never run a delivery as these users (the classic never_users rule).
   "never_users": ["root"],
 
   // Queue behaviour: scan every N seconds (the queue is also processed
@@ -84,11 +88,11 @@
   // Retry every N (default 15m) during the first 2 hours after the first
   // failure, then geometrically growing intervals (1h, 1.5h, ... capped at
   // 16h) until retry_timeout after the first failure, then bounce
-  // (exim.conf defaults).
+  // (classic defaults).
   "retry_first_interval": "15m",
   "retry_timeout": "4d",
   // Bounce messages that still fail are frozen after 2 days and removed
-  // after 7 days (exim.conf defaults).
+  // after 7 days (classic defaults).
   "bounce_freeze_after": "2d",
   "frozen_timeout": "7d",
 }

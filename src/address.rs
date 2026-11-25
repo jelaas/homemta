@@ -1,5 +1,4 @@
-//! RFC 5321 path parsing and the exim-style local-part sanity checks
-//! from the reference exim.conf ACLs.
+//! RFC 5321 path parsing and the classic local-part sanity checks.
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Addr {
@@ -70,13 +69,13 @@ pub fn qualify(local: &str, host: &str) -> Result<Addr, String> {
     parse(&format!("<{}@{}>", local, host))
 }
 
-/// exim ACL rule for local domains: local parts that start with a dot or
-/// contain @ % ! / | are rejected.
+/// ACL-style rule for local domains: local parts that start with a dot
+/// or contain @ % ! / | are rejected.
 pub fn restricted_local(local: &str) -> bool {
     local.starts_with('.') || local.chars().any(|c| "@%!/|".contains(c))
 }
 
-/// exim ACL rule for other domains: local parts that start with ./| or
+/// ACL-style rule for other domains: local parts that start with ./| or
 /// contain @ % ! or the sequence /../ are rejected.
 pub fn restricted_remote(local: &str) -> bool {
     local.starts_with(['.', '/', '|'])
@@ -84,7 +83,7 @@ pub fn restricted_remote(local: &str) -> bool {
         || local.contains("/../")
 }
 
-/// Strip a `+suffix` from a local part (exim `local_part_suffix = +*`).
+/// Strip a `+suffix` from a local part (the classic +-addressing style).
 pub fn strip_suffix(local: &str) -> &str {
     match local.find('+') {
         Some(i) => &local[..i],

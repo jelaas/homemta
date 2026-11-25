@@ -3,20 +3,20 @@
 A minimal MTA for home servers, written in Rust.
 
 - **Receives mail from the internet.** Binds IPv4 `0.0.0.0:25` and accepts
-  mail for `local_domains` from anywhere — but **never relays**: only hosts
-  in `relay_from_hosts` may send to other domains (exim.conf:
-  `relay_from_hosts = 127.0.0.1 : 10.0.0.53`). No open relay, ever.
+  mail for `local_domains` from anywhere — but **never relays**: only
+  trusted hosts in `relay_from_hosts` may send to other domains. No open
+  relay, ever.
 - **Smarthost only for outgoing.** Everything not in a local domain is
   queued and sent through one configured smarthost over SMTPS (or
   STARTTLS).
-- **Local delivery** into `mbox` files under `/var/spool/mail/` in the same
-  format Exim's `appendfile` transport writes and Dovecot reads, including
+- **Local delivery** into `mbox` files under `/var/spool/mail/` in the
+  traditional BSD mailbox format that Dovecot reads, including
   `/etc/aliases` and `~/.forward` handling.
 - **Modern smarthost authentication**: SCRAM-SHA-256 (RFC 7677, preferred),
   CRAM-MD5, PLAIN, LOGIN and XOAUTH2; `"auth": "auto"` picks the strongest
   mechanism the smarthost offers.
 - **IPv4 only**, **TLS support** (STARTTLS for incoming connections, TLS
-  for the smarthost), exim-style retry schedule and bounce messages.
+  for the smarthost), classic retry schedule and bounce messages.
 - **Static musl binary.** Two runtime dependencies: `rustls` (TLS, with
   the pure-Rust `ring` backend) and `libc` (musl bindings). The JSONC
   config parser, DNS, base64, MD5, SHA-256, HMAC, PBKDF2, SCRAM and the
@@ -51,7 +51,7 @@ and trailing commas) and adjust:
 
 | option                       | meaning                                                          |
 | ---------------------------- | ---------------------------------------------------------------- |
-| `primary_hostname`           | this host's FQDN (`exim.conf`: `primary_hostname`)               |
+| `primary_hostname`           | this host's FQDN                                                 |
 | `local_domains`              | domains mail is accepted for and delivered locally               |
 | `relay_from_hosts`           | IPs/CIDRs allowed to send to any domain (default `127.0.0.1`)    |
 | `listen_addr` / `listen_ports` | `0.0.0.0` / `[25]` by default (inbound MX)                      |
@@ -64,7 +64,7 @@ and trailing commas) and adjust:
 | `smarthost.verify`           | `false` to accept self-signed smarthost certs (insecure)         |
 | `tls.cert` / `tls.key`       | enable STARTTLS on the listen ports                              |
 | `mailbox_dir`                | where mbox files live (default `/var/spool/mail`)                |
-| `aliases_file`               | default `/etc/aliases` (exim `system_aliases` router)            |
+| `aliases_file`               | default `/etc/aliases`                                           |
 | `spool_dir`                  | outgoing queue (default `/var/spool/homemta`)                    |
 
 Run it (as root, or with `CAP_NET_BIND_SERVICE`):
@@ -73,19 +73,29 @@ Run it (as root, or with `CAP_NET_BIND_SERVICE`):
 /usr/local/sbin/homemta -c /etc/homemta.jsonc
 ```
 
-A systemd unit is in `contrib/homemta.service`.
+A systemd unit is in `contrib/homemta.service`. On systems without
+systemd, run it as a background daemon:
+
+```sh
+/usr/local/sbin/homemta -b -c /etc/homemta.jsonc --pidfile /run/homemta.pid
+```
+
+`-b`/`--daemon` double-forks and detaches from the terminal; startup
+errors are still printed before detaching. The pid file is written once
+the listeners are up and removed again on clean shutdown.
 
 ### Behaviour notes
 
-- **Accept policy** (mirrors the exim.conf ACLs): local domains are
+- **Accept policy** (the classic ACL checks): local domains are
   accepted from anyone after local-part sanity checks and user
   verification (`verify = recipient`); `postmaster` is always accepted
   (falls back to `root`); non-local recipients are accepted only from
   `relay_from_hosts` and only when a smarthost is configured — everything
   else gets `550 relay not permitted`.
-- Restricted local parts are rejected as in exim.conf (leading dots,
+- Restricted local parts are rejected (leading dots,
   `@ % ! / |`, `/../`).
-- **Submission mode** (exim's `control = submission`) applies only to
+- **Submission mode** (the classic `control = submission` behaviour)
+  applies only to
   `relay_from_hosts` peers: missing `Date:`, `Message-ID:` and `From:`
   headers are added, and unqualified addresses are qualified. Inbound
   mail from the internet is stored as received (with a `Received:` header).
@@ -94,11 +104,17 @@ A systemd unit is in `contrib/homemta.service`.
   `envelope_to_add`, `return_path_add`), `>From ` escaping, and are
   locked while appending.
 - Outgoing mail is queued immediately; temporary failures retry with the
-  exim.conf schedule (`F,2h,15m; G,16h,1h,1.5; F,4d,6h`), permanent
+  classic schedule (`F,2h,15m; G,16h,1h,1.5; F,4d,6h`), permanent
   failures and timeouts produce RFC 3464 bounce messages. Failing bounces
   freeze after 2 days and are removed after 7 (`ignore_bounce_errors_after`,
   `timeout_frozen_after`).
 - `homemta -q` processes the queue once and exits (useful for cron).
+- **Logging**: all log output goes to the `log_file` from the
+  configuration. Without a configured `log_file`, messages go to stderr —
+  which works in the foreground, but in daemon mode (`-b`) stdout/stderr
+  are detached, so a `log_file` is effectively required there (a warning
+  is printed at startup if it is missing). `-d` additionally mirrors the
+  log to stderr.
 - `homemta --exit-on-stdin-eof` shuts the daemon down when its stdin
   closes; handy for supervisors and sandboxes where signalling is
   unavailable.

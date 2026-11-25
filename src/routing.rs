@@ -1,9 +1,10 @@
-//! Local routing: /etc/aliases, ~/.forward, and delivery into Exim/Dovecot
-//! compatible mbox files under the mailbox directory.
+//! Local routing: /etc/aliases, ~/.forward, and delivery into the
+//! traditional BSD mailbox format (readable by Dovecot) under the mailbox
+//! directory.
 //!
 //! Message bodies are carried around CRLF-normalized (as received via SMTP);
-//! mbox files are written with LF line endings and `>From ` escaping, which
-//! is what Exim's appendfile transport produces and Dovecot reads.
+//! mbox files are written with LF line endings and `>From ` escaping,
+//! matching the classic appendfile transports that Dovecot reads.
 
 use crate::address::{strip_suffix, Addr};
 use crate::config::Config;
@@ -67,7 +68,8 @@ pub fn getgrnam(cfg: &Config, name: &str) -> Option<u32> {
 /// Resolve a local user id for pipes/files from /etc/aliases.
 
 /// Verify that a local recipient is deliverable (used at RCPT time).
-/// Matches Exim's verify=recipient: alias hit, or a real local user,
+/// Verifies recipients the classic way (verify = recipient): alias hit,
+/// or a real local user,
 /// or postmaster (always accepted per the ACL).
 pub fn verify_local(cfg: &Config, local: &str) -> bool {
     if alias_lookup(cfg, local).is_some() {
@@ -93,7 +95,7 @@ pub fn expand(cfg: &Config, addr: &Addr, chain: &mut Vec<String>) -> Result<Vec<
 }
 
 fn expand_inner(cfg: &Config, addr: &Addr, chain: &mut Vec<String>) -> Result<Vec<Target>, String> {
-    // 1. System aliases (with optional +suffix, exim local_part_suffix = +*).
+    // 1. System aliases (with an optional +suffix).
     if let Some(items) = alias_lookup(cfg, &addr.local) {
         let mut out = Vec::new();
         for item in items {
@@ -166,7 +168,7 @@ fn expand_item(cfg: &Config, item: &str, chain: &mut Vec<String>) -> Result<Vec<
     }
 }
 
-/// Look up a local part in the aliases file (exim lsearch style).
+/// Look up a local part in the aliases file (linear-search style).
 pub fn alias_lookup(cfg: &Config, local: &str) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(&cfg.aliases_file).ok()?;
     for candidate in [local.to_string(), strip_suffix(local).to_string()] {
@@ -234,8 +236,8 @@ pub fn deliver_local(
             Target::File { path } => deliver_file(sender, rcpt_full, &path, msg)?,
             Target::Pipe { cmd } => {
                 // Pipes from aliases/.forward run as the daemon user,
-                // matching exim's default (address_pipe has no `user`
-                // setting in the reference config).
+                // matching the classic default (no explicit user
+                // configured for pipe deliveries).
                 deliver_pipe(&cmd, sender, rcpt_full, msg)?;
             }
             Target::Blackhole => {}
@@ -244,10 +246,10 @@ pub fn deliver_local(
     Ok(remote)
 }
 
-/// Append to a user's mbox in Exim/Dovecot compatible format.
+/// Append to a user's mbox in the traditional BSD mailbox format.
 /// Adds the envelope "From " line plus Return-path:, Envelope-to: and
-/// Delivery-date: headers, exactly like Exim's appendfile transport with
-/// delivery_date_add, envelope_to_add and return_path_add.
+/// Delivery-date: headers (the classic delivery_date_add, envelope_to_add
+/// and return_path_add options).
 ///
 /// The daemon normally runs unprivileged; mbox files must be owned by the
 /// mailbox user, so delivery goes through the setuid-root helper which
@@ -416,9 +418,9 @@ fn deliver_mbox_via_helper(
     }
 }
 
-/// Append to a file target from /etc/aliases or .forward. Same added headers
-/// as Exim's address_file transport; no "From " line. Runs as the daemon
-/// user (exim's default for address_file without an explicit `user`).
+/// Append to a file target from /etc/aliases or .forward. Same added
+/// headers as classic file deliveries; no "From " line. Runs as the daemon
+/// user (the classic default when no explicit user is configured).
 fn deliver_file(
     sender: &str,
     rcpt_full: &str,
@@ -463,8 +465,8 @@ fn lf_escape(msg: &[u8]) -> Vec<u8> {
 }
 
 /// Pipe the message through a shell command (alias/forward pipe target).
-/// Runs as the daemon user, like exim's address_pipe transport without an
-/// explicit `user` setting.
+/// Runs as the daemon user, like classic pipe deliveries without an
+/// explicit user setting.
 fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
     let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")

@@ -15,6 +15,78 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     queue::request_shutdown();
 }
 
+/// Detach from the terminal: double-fork, new session, stdin from
+/// /dev/null. stdout/stderr stay attached until logging is initialized so
+/// startup errors remain visible; see detach_stdio().
+fn daemonize() {
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("homemta: fork failed");
+            std::process::exit(1);
+        }
+        if pid > 0 {
+            // Original process: done.
+            std::process::exit(0);
+        }
+        // Child: new session, then a second fork so we can never reacquire
+        // a controlling terminal.
+        if libc::setsid() < 0 {
+            eprintln!("homemta: setsid failed");
+            std::process::exit(1);
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("homemta: fork failed");
+            std::process::exit(1);
+        }
+        if pid > 0 {
+            std::process::exit(0);
+        }
+        // Grandchild: detach stdin.
+        let null = libc::open(
+            b"/dev/null\0".as_ptr() as *const libc::c_char,
+            libc::O_RDONLY,
+        );
+        if null >= 0 {
+            libc::dup2(null, 0);
+            if null > 2 {
+                libc::close(null);
+            }
+        }
+    }
+}
+
+/// Silence stdout/stderr once logging is established (daemon mode).
+fn detach_stdio() {
+    unsafe {
+        let null = libc::open(
+            b"/dev/null\0".as_ptr() as *const libc::c_char,
+            libc::O_WRONLY,
+        );
+        if null >= 0 {
+            libc::dup2(null, 1);
+            libc::dup2(null, 2);
+            if null > 2 {
+                libc::close(null);
+            }
+        }
+    }
+}
+
+fn write_pidfile(cfg: &Config) {
+    let Some(p) = &cfg.pid_file else { return };
+    if let Err(e) = std::fs::write(p, format!("{}\n", std::process::id())) {
+        log::error(&format!("cannot write pid file {}: {}", p, e));
+    }
+}
+
+fn remove_pidfile(cfg: &Config) {
+    if let Some(p) = &cfg.pid_file {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -79,6 +151,8 @@ fn usage() -> ! {
         "usage: homemta [options]\n\
          options:\n\
          \x20 -c FILE   configuration file (default /etc/homemta.jsonc)\n\
+         \x20 -b        run as a background daemon (double fork, detach)\n\
+         \x20 --pidfile FILE  write the daemon pid to FILE (init scripts)\n\
          \x20 -q        run the queue once and exit\n\
          \x20 -d        debug logging to stderr\n\
          \x20 -V        show version and exit\n\
@@ -226,8 +300,8 @@ fn helper_deliver_mbox(user: &str, config_path: &str) -> ! {
         std::process::exit(1);
     }
     // Keep the "mail" group so the mailbox directory (mode 2775, group
-    // mail) stays writable after setuid - exim's `group = mail` transport
-    // setting.
+    // mail) stays writable after setuid - the classic `group = mail`
+    // transport setting.
     let mail_gid = routing::getgrnam(&cfg, "mail");
     let mut groups: Vec<u32> = vec![u.gid];
     if let Some(mg) = mail_gid {
@@ -260,6 +334,8 @@ fn main() {
     let mut config_path = "/etc/homemta.jsonc".to_string();
     let mut queue_only = false;
     let mut debug = false;
+    let mut daemon_mode = false;
+    let mut pidfile_arg: Option<String> = None;
     let mut exit_on_stdin_eof = false;
     let mut deliver_user: Option<String> = None;
     while let Some(a) = args.next() {
@@ -270,6 +346,11 @@ fn main() {
             },
             "-q" | "--queue-run" => queue_only = true,
             "-d" | "--debug" => debug = true,
+            "-b" | "--daemon" => daemon_mode = true,
+            "--pidfile" => match args.next() {
+                Some(v) => pidfile_arg = Some(v),
+                None => usage(),
+            },
             "--exit-on-stdin-eof" => exit_on_stdin_eof = true,
             "--deliver-mbox" => match args.next() {
                 Some(v) => deliver_user = Some(v),
@@ -288,8 +369,28 @@ fn main() {
         helper_deliver_mbox(&user, &config_path);
     }
 
-    let cfg = Arc::new(load_config(&config_path));
+    // Detach first so the invoking shell gets its prompt back immediately;
+    // stdout/stderr remain attached until logging is initialized below, so
+    // startup errors (e.g. a broken config) still reach the terminal.
+    if daemon_mode {
+        daemonize();
+    }
+
+    let mut cfg = load_config(&config_path);
+    if let Some(p) = pidfile_arg {
+        cfg.pid_file = Some(p);
+    }
+    let cfg = Arc::new(cfg);
     log::init(cfg.log_file.as_deref(), debug);
+
+    if daemon_mode {
+        if cfg.log_file.is_none() {
+            eprintln!(
+                "homemta: warning: daemon mode without a log_file; logging will be lost"
+            );
+        }
+        detach_stdio();
+    }
     log::info(&format!(
         "homemta {} starting: hostname {}, smarthost {:?}",
         env!("CARGO_PKG_VERSION"),
@@ -348,6 +449,7 @@ fn main() {
 
     // Bind before dropping privileges: port 25 requires root.
     let listeners = bind_listeners(&cfg);
+    write_pidfile(&cfg);
     drop_privileges(&cfg);
 
     let (wake_tx, wake_rx) = mpsc::channel();
@@ -355,7 +457,8 @@ fn main() {
     // Test/debug helper: shut down when stdin reaches EOF. Lets supervisors
     // (and the integration tests) stop the daemon without signalling it,
     // which matters in sandboxes where the kill syscall is unavailable.
-    if exit_on_stdin_eof {
+    // Meaningless in daemon mode (stdin is /dev/null).
+    if exit_on_stdin_eof && !daemon_mode {
         let stdin_wake = wake_tx.clone();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -388,5 +491,6 @@ fn main() {
         let _ = h.join();
     }
     let _ = runner.join();
+    remove_pidfile(&cfg);
     log::info("homemta exiting");
 }

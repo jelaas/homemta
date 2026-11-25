@@ -60,17 +60,20 @@ pub struct Config {
     pub smarthost_verify: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    /// Unprivileged identity the daemon drops to after binding (exim's
-    /// "exim" user). Use "root" to explicitly keep running as root.
+    /// Unprivileged identity the daemon drops to after binding (the classic
+    /// "mail" user). Use "root" to explicitly keep running as root.
     pub user: String,
     /// Group for the daemon (defaults to the user's primary gid).
     pub group: Option<String>,
     /// Setuid-root helper used to deliver user-owned mailboxes.
     pub deliver_helper: String,
-    /// Never run a delivery as these users (exim.conf: never_users = root).
+    /// Never run a delivery as these users (the classic never_users rule).
     pub never_users: Vec<String>,
     /// Path of the loaded config file (set at startup, not from the file).
     pub config_path: String,
+    /// Optional pid file written after startup and removed on shutdown
+    /// (also settable via --pidfile).
+    pub pid_file: Option<String>,
     /// Seconds between queue scans.
     pub queue_interval: u64,
     /// Retry interval for the first 2h after first failure (seconds).
@@ -113,6 +116,7 @@ impl Default for Config {
             deliver_helper: "/usr/local/libexec/homemta-deliver".to_string(),
             never_users: vec!["root".to_string()],
             config_path: String::new(),
+            pid_file: None,
             queue_interval: 30,
             retry_first_interval: 900,
             retry_timeout: 4 * 24 * 3600,
@@ -228,6 +232,10 @@ impl Config {
                 },
                 "deliver_helper" => want_str(key, v).map(|s| self.deliver_helper = s),
                 "never_users" => want_str_list(key, v).map(|l| self.never_users = l),
+                "pid_file" => match v {
+                    Json::Null => Ok(self.pid_file = None),
+                    _ => want_str(key, v).map(|s| self.pid_file = Some(s)),
+                },
                 "queue_interval" => {
                     want_u64(key, v).and_then(|n| {
                         if n > 0 {
@@ -400,7 +408,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid size: {}", s))
 }
 
-/// Parse a duration in seconds, or with s/m/h/d/w suffix (exim style).
+/// Parse a duration in seconds, or with s/m/h/d/w suffixes.
 pub fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {

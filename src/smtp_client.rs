@@ -1,4 +1,4 @@
-//! SMTP client for the smarthost (per exim.conf: SMTPS on port 465 with
+//! SMTP client for the smarthost (SMTPS on port 465 with
 //! CRAM-MD5 or PLAIN authentication). No relaying, no MX lookups: every
 //! remote message goes through the smarthost.
 
