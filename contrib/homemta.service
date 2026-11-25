@@ -1,0 +1,25 @@
+[Unit]
+Description=homemta - minimal home-server MTA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/homemta -c /etc/homemta.jsonc
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# Port 25 needs root or CAP_NET_BIND_SERVICE. With the capability you can
+# run as an unprivileged user and drop these lines.
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#User=mail
+#Group=mail
+
+# Local delivery writes /var/spool/mail/<user>; keep the spool private.
+ProtectSystem=strict
+ReadWritePaths=/var/spool/mail /var/spool/homemta /var/log
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

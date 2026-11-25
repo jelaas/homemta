@@ -1,0 +1,94 @@
+// homemta configuration (JSONC: JSON with comments and trailing commas).
+// Copy to /etc/homemta.jsonc and adjust.
+
+{
+  // Canonical hostname of this machine.
+  "primary_hostname": "myhost.example.com",
+
+  // Domains for which mail is accepted and delivered locally (into
+  // mailbox_dir). "@" means the primary hostname.
+  "local_domains": ["@"],
+
+  // Hosts allowed to submit mail to ANY domain (exim.conf:
+  // relay_from_hosts). Exact IPv4 addresses or CIDR ranges. Everyone else
+  // may only send to local_domains - there is no open relaying.
+  "relay_from_hosts": ["127.0.0.1"],
+
+  // Inbound listener. 0.0.0.0:25 to receive mail from the internet (like
+  // exim), or 127.0.0.1 for submission-only setups.
+  "listen_addr": "0.0.0.0",
+  "listen_ports": [25],
+
+  // Spool (outgoing queue).
+  "spool_dir": "/var/spool/homemta",
+
+  // Local mailboxes: one mbox file per user, exim/dovecot compatible.
+  "mailbox_dir": "/var/spool/mail",
+
+  // Lookup files. Format matches /etc/aliases, /etc/passwd, /etc/group.
+  "aliases_file": "/etc/aliases",
+  "passwd_file": "/etc/passwd",
+  "group_file": "/etc/group",
+
+  "log_file": "/var/log/homemta.log",
+
+  // Maximum accepted message size (bytes, or "K"/"M"/"G" suffix).
+  "max_message_size": "64M",
+
+  // All non-local mail goes to this smarthost.
+  "smarthost": {
+    "host": "mailout.privat.bahnhof.se",
+    "port": 465,
+    // "smtps" = TLS immediately on connect (port 465),
+    // "starttls" = STARTTLS upgrade, "none" = plaintext.
+    "tls": "smtps",
+    // "auto" prefers SCRAM-SHA-256, then CRAM-MD5, PLAIN, LOGIN.
+    // Force one of: "scram-sha-256", "cram-md5", "plain", "login",
+    // "xoauth2" (password = access token), "none".
+    "auth": "auto",
+    "username": "myuser",
+    "password": "mypassword",
+    // CA bundle used to verify the smarthost certificate. Point this at a
+    // fresh bundle if your system's ca-certificates are outdated, e.g.:
+    //   curl -o /etc/ssl/certs/cacert.pem https://curl.se/ca/cacert.pem
+    // The file must contain one or more PEM CERTIFICATE blocks and must be
+    // readable by the daemon user. It is re-read on every smarthost
+    // connection, so swapping in a new bundle takes effect immediately.
+    "ca_file": "/etc/ssl/certs/ca-certificates.crt",
+    // Set false only if your smarthost uses a self-signed certificate.
+    "verify": true,
+  },
+
+  // TLS for incoming connections (STARTTLS on the listen ports).
+  // Remove this section to disable STARTTLS. The key must not be encrypted.
+  "tls": {
+    "cert": "/etc/ssl/homemta.crt",
+    "key": "/etc/ssl/homemta.key",
+  },
+
+  // Privilege separation: the daemon binds port 25 as root, then drops to
+  // this user (exim's "exim" user equivalent). Use "root" only for
+  // containers or debugging.
+  "user": "mail",
+  // Optional group (defaults to the user's primary group).
+  //"group": "mail",
+  // Setuid-root helper that appends to user-owned mailboxes. Install with:
+  //   install -m4755 -o root -g root homemta /usr/local/libexec/homemta-deliver
+  "deliver_helper": "/usr/local/libexec/homemta-deliver",
+  // Never run a delivery as these users (exim.conf: never_users = root).
+  "never_users": ["root"],
+
+  // Queue behaviour: scan every N seconds (the queue is also processed
+  // immediately after every accepted message).
+  "queue_interval": 30,
+  // Retry every N (default 15m) during the first 2 hours after the first
+  // failure, then geometrically growing intervals (1h, 1.5h, ... capped at
+  // 16h) until retry_timeout after the first failure, then bounce
+  // (exim.conf defaults).
+  "retry_first_interval": "15m",
+  "retry_timeout": "4d",
+  // Bounce messages that still fail are frozen after 2 days and removed
+  // after 7 days (exim.conf defaults).
+  "bounce_freeze_after": "2d",
+  "frozen_timeout": "7d",
+}

@@ -1,0 +1,27 @@
+[package]
+name = "homemta"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal MTA for home servers: local submission on localhost, mbox delivery, smarthost sending"
+license = "MIT"
+
+[dependencies]
+# TLS: pure-Rust stack (rustls + ring). ring compiles a few C/asm files at build
+# time but links no system C libraries beyond libc, so the final binary is fully
+# static against musl libc.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# musl libc bindings only (explicitly permitted): getaddrinfo, fcntl, signals,
+# local time. Everything else is std or hand-written.
+libc = "0.2"
+
+[dev-dependencies]
+# Test-only: generates self-signed certificates for the smoke tests.
+# Never part of the shipped binary.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
