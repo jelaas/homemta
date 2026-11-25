@@ -13,7 +13,7 @@ use crate::log;
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -71,6 +71,14 @@ impl Write for Io {
             Io::Tls(s) => s.flush(),
         }
     }
+}
+
+/// A HELO/EHLO argument ends up in the Received: header, so only
+/// characters that are safe there are allowed (no controls, no spaces).
+pub fn valid_helo(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-[]:".contains(c))
 }
 
 struct Session {
@@ -167,6 +175,11 @@ impl Session {
                 "HELO" | "EHLO" => {
                     if arg.is_empty() {
                         self.reply(501, "HELO requires an argument");
+                    } else if !valid_helo(&arg) {
+                        // The argument ends up in the Received: header, so
+                        // anything else (controls, spaces, \r) must be
+                        // rejected to prevent header injection.
+                        self.reply(501, "invalid HELO argument");
                     } else {
                         self.helo = Some(arg.clone());
                         if verb == "EHLO" {
@@ -589,6 +602,7 @@ fn serve_port(
     listener: TcpListener,
     tls_config: Option<Arc<ServerConfig>>,
     wake: mpsc::Sender<()>,
+    active: Arc<AtomicUsize>,
 ) {
     let bind = match listener.local_addr() {
         Ok(a) => a.to_string(),
@@ -598,6 +612,17 @@ fn serve_port(
     while !crate::queue::shutdown_flag() {
         match listener.accept() {
             Ok((sock, peer)) => {
+                // Connection-flood guard: refuse extra sessions instead of
+                // letting an attacker exhaust threads/memory.
+                if active.load(Ordering::Relaxed) >= cfg.max_sessions {
+                    let mut s = sock;
+                    let _ = s.write_all(
+                        b"421 too many concurrent connections, please try again later\r\n",
+                    );
+                    continue;
+                }
+                active.fetch_add(1, Ordering::Relaxed);
+                let active = active.clone();
                 let cfg = cfg.clone();
                 let wake = wake.clone();
                 let tls_config = tls_config.clone();
@@ -622,6 +647,7 @@ fn serve_port(
                         quit: false,
                     };
                     s.handle();
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -642,13 +668,15 @@ pub fn serve(
     wake: mpsc::Sender<()>,
     listeners: Vec<TcpListener>,
 ) -> Vec<std::thread::JoinHandle<()>> {
+    let active = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for listener in listeners {
         let cfg = cfg.clone();
         let tls_config = tls_config.clone();
         let wake = wake.clone();
+        let active = active.clone();
         handles.push(std::thread::spawn(move || {
-            serve_port(cfg, listener, tls_config, wake);
+            serve_port(cfg, listener, tls_config, wake, active);
         }));
     }
     handles
@@ -663,6 +691,18 @@ mod tests {
         c.primary_hostname = "test.example".to_string();
         c.local_domains = vec!["test.example".to_string()];
         c
+    }
+
+    #[test]
+    fn helo_validation() {
+        assert!(valid_helo("mail.example.com"));
+        assert!(valid_helo("[192.0.2.1]"));
+        assert!(valid_helo("localhost"));
+        assert!(!valid_helo(""));
+        assert!(!valid_helo("a b"));
+        assert!(!valid_helo("a\r\nBcc: evil@x"));
+        assert!(!valid_helo("a\tb"));
+        assert!(!valid_helo("a@b"));
     }
 
     #[test]

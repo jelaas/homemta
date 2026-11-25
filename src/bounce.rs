@@ -14,10 +14,41 @@ fn msgid(host: &str) -> String {
     format!("<E{:x}{:08x}@{}>", crate::log::unix_now(), n % 0xffff_ffff, host)
 }
 
+/// Strip anything that could terminate or confuse header lines in a
+/// bounce: truncate at the first CR/LF/NUL or other control character.
+fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .take_while(|c| *c >= ' ' && *c != '\u{7f}')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn random_boundary() -> String {
+    let mut buf = [0u8; 12];
+    let seed = crate::log::unix_now().to_le_bytes();
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut buf).is_err() {
+            buf = seed.repeat(2).as_slice()[..12].try_into().unwrap_or([7u8; 12]);
+        }
+    } else {
+        buf = seed.repeat(2).as_slice()[..12].try_into().unwrap_or([7u8; 12]);
+    }
+    format!(
+        "homemta-{:x}-{:x}",
+        u64::from_le_bytes(buf[..8].try_into().unwrap_or([0; 8])),
+        u32::from_le_bytes(buf[8..].try_into().unwrap_or([0; 4]))
+    )
+}
+
 /// Build a bounce message addressed to `sender` reporting `failures`.
 /// The returned bytes are CRLF-normalized.
 pub fn build(hostname: &str, sender: &str, failures: &[Failure], original: &[u8]) -> Vec<u8> {
-    let boundary = format!("homemta-{:x}", crate::log::unix_now());
+    // Unpredictable boundary: the original message is attacker-influenced
+    // and must not be able to guess the boundary and smuggle MIME parts.
+    let boundary = random_boundary();
+    let sender = sanitize_text(sender);
     let mut m = String::new();
     m.push_str(&format!(
         "Return-path: <>\r\n\
@@ -48,7 +79,11 @@ pub fn build(hostname: &str, sender: &str, failures: &[Failure], original: &[u8]
         boundary
     ));
     for f in failures {
-        m.push_str(&format!("  {}\r\n    {}\r\n\r\n", f.rcpt, f.reason));
+        m.push_str(&format!(
+            "  {}\r\n    {}\r\n\r\n",
+            sanitize_text(&f.rcpt),
+            sanitize_text(&f.reason)
+        ));
     }
     m.push_str(&format!(
         "--{}\r\n\
@@ -65,7 +100,8 @@ pub fn build(hostname: &str, sender: &str, failures: &[Failure], original: &[u8]
              Status: 5.0.0\r\n\
              Diagnostic-Code: smtp; {}\r\n\
              \r\n",
-            f.rcpt, f.reason
+            sanitize_text(&f.rcpt),
+            sanitize_text(&f.reason)
         ));
     }
     m.push_str(&format!(
@@ -141,5 +177,45 @@ mod tests {
         assert!(s.contains("Subject: hi"));
         assert!(s.ends_with("\r\n"));
         assert!(s.contains("--"));
+    }
+
+    #[test]
+    fn sanitizes_reason_and_sender() {
+        let b = build(
+            "host.example",
+            "sender@example.com\r\nBcc: evil@example.net",
+            &[Failure {
+                rcpt: "x@y.z".to_string(),
+                reason: "550 bad\r\nX-Evil: injected".to_string(),
+            }],
+            b"Subject: hi\r\n\r\nbody\r\n",
+        );
+        let s = String::from_utf8(b).unwrap();
+        assert!(!s.contains("X-Evil"), "injected header must be stripped");
+        assert!(!s.contains("Bcc: evil"), "injected header must be stripped");
+        assert!(s.contains("550 bad"));
+    }
+
+    #[test]
+    fn boundary_is_unpredictable() {
+        let f = || {
+            let b = build(
+                "h",
+                "s@d",
+                &[Failure { rcpt: "a@b".into(), reason: "x".into() }],
+                b"m\r\n",
+            );
+            let s = String::from_utf8(b).unwrap();
+            let line = s
+                .lines()
+                .find(|l| l.starts_with("Content-Type: multipart/report"))
+                .unwrap()
+                .to_string();
+            line.split("boundary=").nth(1).unwrap().to_string()
+        };
+        let b1 = f();
+        let b2 = f();
+        assert_ne!(b1, b2, "boundaries must not be predictable");
+        assert!(b1.len() > 20, "boundary must contain random material");
     }
 }

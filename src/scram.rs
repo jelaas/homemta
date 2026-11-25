@@ -10,6 +10,15 @@ fn xor(a: &mut [u8], b: &[u8]) {
     }
 }
 
+/// Constant-time comparison for digests/signatures.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    a.len() == b.len() && diff == 0
+}
+
 fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
     hmac_sha256(key, msg)
 }
@@ -132,10 +141,9 @@ pub fn verify_server_final(
         let server_key = hmac(&salted, b"Server Key");
         hmac(&server_key, auth_message.as_bytes()).to_vec()
     };
-    if v.as_deref() == Some(expected.as_slice()) {
-        Ok(())
-    } else {
-        Err("SCRAM server signature mismatch".to_string())
+    match v {
+        Some(v) if ct_eq(&v, &expected) => Ok(()),
+        _ => Err("SCRAM server signature mismatch".to_string()),
     }
 }
 
@@ -154,7 +162,7 @@ pub fn check_client_proof(
     let signature = client_signature(&stored_key, auth_message);
     let mut expected = client_key;
     xor(&mut expected, &signature);
-    expected == proof
+    ct_eq(&expected, proof)
 }
 
 /// Compute the server signature for a given exchange (tests / debugging).

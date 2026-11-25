@@ -10,7 +10,7 @@ use crate::address::{strip_suffix, Addr};
 use crate::config::Config;
 use crate::log;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{chown, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -262,6 +262,10 @@ fn deliver_mbox(cfg: &Config, user: &User, sender: &str, rcpt_full: &str, msg: &
             user.name
         ));
     }
+    // Defence in depth: a user name is used as a file name component.
+    if user.name.is_empty() || user.name.contains('/') || user.name == "." || user.name == ".." {
+        return Err(format!("unsafe user name `{}`", user.name));
+    }
     if unsafe { libc::geteuid() } == 0 {
         // Root daemon: direct append, make the mailbox user-owned.
         let path = Path::new(&cfg.mailbox_dir).join(&user.name);
@@ -270,8 +274,16 @@ fn deliver_mbox(cfg: &Config, user: &User, sender: &str, rcpt_full: &str, msg: &
         append_mbox(&mut f, sender, rcpt_full, msg)?;
         if created {
             // Owned by the user, group mail if it exists (Dovecot friendly).
+            // fchown on the handle, not chown on the path: the path could
+            // have been swapped for a symlink between open() and chown().
             let gid = getgrnam(cfg, "mail").unwrap_or(user.gid);
-            let _ = chown(&path, Some(user.uid), Some(gid));
+            unsafe {
+                let _ = libc::fchown(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                    user.uid,
+                    gid,
+                );
+            }
             let _ = f.set_permissions(std::fs::Permissions::from_mode(0o660));
         }
         Ok(())
@@ -282,12 +294,16 @@ fn deliver_mbox(cfg: &Config, user: &User, sender: &str, rcpt_full: &str, msg: &
 }
 
 fn open_mbox(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .append(true)
         .create(true)
         .mode(0o660)
+        // Never follow symlinks: the mailbox path is predictable and a
+        // local attacker could otherwise point it at an arbitrary file.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| format!("{}: {}", path.display(), e))
 }
@@ -427,10 +443,13 @@ fn deliver_file(
     path: &str,
     msg: &[u8],
 ) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        // Never follow symlinks for alias/forward file targets either.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| format!("{}: {}", path, e))?;
     f.lock().map_err(|e| format!("{}: lock failed: {}", path, e))?;
@@ -638,6 +657,49 @@ mod tests {
         assert!(content.starts_with("From sender@example.org "));
         assert_eq!(content.matches("\nFrom b@c ").count(), 1);
         assert_eq!(content.matches("Return-path:").count(), 2);
+    }
+
+    #[test]
+    fn mbox_refuses_symlinks() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let c = test_cfg(&tmp);
+        let target = tmp.join("victim");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = tmp.join("mail").join("jelaas");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let cfg = Arc::new(c);
+        let r = deliver_local(
+            &cfg,
+            "s@d",
+            "jelaas@jelaas.eu",
+            b"Subject: x\r\n\r\nbody\r\n",
+        );
+        assert!(r.is_err(), "delivery through a symlink must fail");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn unsafe_user_names_refused() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-unsafe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let c = test_cfg(&tmp);
+        // A passwd entry with a path-traversal name must not escape the
+        // mailbox directory even if the root daemon path is used.
+        std::fs::write(
+            c.passwd_file.clone(),
+            "root:x:0:0:root:/root:/bin/sh\n../../etc/passwd:x:1001:1001:X:/tmp:/bin/sh\n",
+        )
+        .unwrap();
+        let cfg = Arc::new(c);
+        let r = deliver_local(
+            &cfg,
+            "s@d",
+            "../../etc/passwd@jelaas.eu",
+            b"Subject: x\r\n\r\nbody\r\n",
+        );
+        assert!(r.is_err());
+        assert!(!tmp.join("etc").exists());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! Accepts mail from the internet for local domains only; no relaying.
 //! IPv4 only, static musl build.
 
-use homemta::config::{Config, TlsMode};
+use homemta::config::{self, Config, TlsMode};
 use homemta::{log, queue, routing, smtp_server, tls};
 use std::net::TcpListener;
 use std::sync::{mpsc, Arc};
@@ -113,6 +113,12 @@ fn lock_spool(dir: &str) -> std::fs::File {
 }
 
 fn load_config(path: &str) -> Config {
+    load_config_strict(path, false)
+}
+
+/// strict = true makes an insecure config file (non-root owner or
+/// group/other-writable) fatal. The setuid helper uses strict mode.
+fn load_config_strict(path: &str, strict: bool) -> Config {
     let mut cfg = Config::default();
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -136,10 +142,15 @@ fn load_config(path: &str) -> Config {
     if let Ok(md) = std::fs::metadata(path) {
         use std::os::unix::fs::MetadataExt;
         if md.uid() != 0 || md.mode() & 0o022 != 0 {
-            eprintln!(
-                "homemta: config file {} must be owned by root and not writable by group/other",
+            let msg = format!(
+                "config file {} must be owned by root and not writable by group/other",
                 path
             );
+            if strict {
+                eprintln!("homemta: refusing to run: {}", msg);
+                std::process::exit(1);
+            }
+            eprintln!("homemta: warning: {}", msg);
         }
     }
     cfg.config_path = path.to_string();
@@ -232,6 +243,12 @@ fn prepare_dirs(cfg: &Config) {
         if let Some(u) = routing::getpwnam(cfg, &cfg.user) {
             if std::fs::create_dir_all(&cfg.spool_dir).is_ok() {
                 let _ = std::os::unix::fs::chown(&cfg.spool_dir, Some(u.uid), Some(u.gid));
+                // The spool holds complete messages: keep it private to
+                // the daemon user.
+                let _ = std::fs::set_permissions(
+                    &cfg.spool_dir,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
             }
         }
     }
@@ -269,7 +286,7 @@ fn helper_deliver_mbox(user: &str, config_path: &str) -> ! {
         eprintln!("homemta-deliver: must be installed setuid root (effective uid is {})", euid());
         std::process::exit(1);
     }
-    let cfg = load_config(config_path);
+    let cfg = load_config_strict(config_path, true);
     // Envelope: two lines, then the message.
     const CAP: u64 = 128 * 1024 * 1024;
     let mut input = Vec::new();
@@ -445,6 +462,15 @@ fn main() {
                 }
             }
         }
+    }
+    if !cfg.smarthost_verify
+        && cfg.smarthost_auth != config::AuthMode::None
+        && cfg.smarthost_user.is_some()
+    {
+        log::warn(
+            "smarthost certificate verification is disabled while credentials are \
+             configured: a man-in-the-middle could steal them",
+        );
     }
 
     // Bind before dropping privileges: port 25 requires root.

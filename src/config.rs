@@ -74,6 +74,9 @@ pub struct Config {
     /// Optional pid file written after startup and removed on shutdown
     /// (also settable via --pidfile).
     pub pid_file: Option<String>,
+    /// Maximum concurrent SMTP sessions (protects against connection
+    /// floods; extra connections get 421).
+    pub max_sessions: usize,
     /// Seconds between queue scans.
     pub queue_interval: u64,
     /// Retry interval for the first 2h after first failure (seconds).
@@ -117,6 +120,7 @@ impl Default for Config {
             never_users: vec!["root".to_string()],
             config_path: String::new(),
             pid_file: None,
+            max_sessions: 64,
             queue_interval: 30,
             retry_first_interval: 900,
             retry_timeout: 4 * 24 * 3600,
@@ -236,6 +240,14 @@ impl Config {
                     Json::Null => Ok(self.pid_file = None),
                     _ => want_str(key, v).map(|s| self.pid_file = Some(s)),
                 },
+                "max_sessions" => want_u64(key, v).and_then(|n| {
+                    if n > 0 && n <= 65536 {
+                        self.max_sessions = n as usize;
+                        Ok(())
+                    } else {
+                        Err(format!("`{}` must be between 1 and 65536", key))
+                    }
+                }),
                 "queue_interval" => {
                     want_u64(key, v).and_then(|n| {
                         if n > 0 {

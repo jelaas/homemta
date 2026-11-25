@@ -150,6 +150,11 @@ consulted, so old distro packages don't matter.
 - No outbound delivery directly to destination MXes: everything goes
   through the smarthost.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the full security audit (cryptography,
+authentication, untrusted-input handling) and operational recommendations.
+
 ## Tests
 
 ```sh
