@@ -190,7 +190,9 @@ INTERNAL - used by the setuid delivery helper, not meant for direct use:
                       by homemta itself through the setuid-root helper
                       binary (homemta-deliver). It requires root, validates
                       the target user and the config file, and refuses root
-                      and never_users. There is no need to call it manually.
+                      and never_users. When invoked via the setuid bit, this
+                      is the ONLY mode the binary accepts; all other modes
+                      are refused. There is no need to call it manually.
 
 MAIL FLOW:
     Inbound SMTP on the configured ports is accepted only for local domains
@@ -412,6 +414,19 @@ fn main() {
             "-h" | "--help" => help(),
             _ => usage(),
         }
+    }
+
+    // A setuid invocation (real uid != 0 but effective uid 0) may ONLY run
+    // the delivery helper. Any other mode would execute privileged startup
+    // code (binding ports, chown/chmod, writing the pid file) with
+    // attacker-controlled arguments, i.e. a root file-write primitive.
+    let setuid_invocation = unsafe { libc::geteuid() == 0 && libc::getuid() != 0 };
+    if setuid_invocation && deliver_user.is_none() {
+        eprintln!(
+            "homemta: invoked via the setuid bit without --deliver-mbox; \
+             the setuid binary only supports delivery-helper mode"
+        );
+        std::process::exit(1);
     }
 
     if let Some(user) = deliver_user {

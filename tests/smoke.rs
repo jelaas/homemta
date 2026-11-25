@@ -1321,3 +1321,55 @@ fn daemon_mode_serves_and_writes_pidfile() {
         eprintln!("daemon test: signals unavailable, leaving daemon {} running", pid);
     }
 }
+
+/// The setuid binary must refuse to run anything but the delivery helper:
+/// otherwise it would execute the daemon's privileged startup code with
+/// attacker-controlled arguments (e.g. --pidfile /some/root/file).
+#[test]
+fn setuid_binary_refuses_non_helper_modes() {
+    if !can_setuid() {
+        eprintln!("skipping setuid test: setuid(2) unavailable in this sandbox");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "homemta-setuid-guard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("homemta-deliver");
+    std::fs::copy(env!("CARGO_BIN_EXE_homemta"), &helper).unwrap();
+    let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(perms.mode() | 0o4755);
+    std::fs::set_permissions(&helper, perms).unwrap();
+
+    // Run the setuid binary as an unprivileged user (real uid 1000, euid 0)
+    // in daemon mode with an attacker-chosen pid file: must be refused.
+    use std::os::unix::process::CommandExt;
+    let victim = dir.join("victim");
+    let out = std::process::Command::new(&helper)
+        .arg("-c")
+        .arg("/etc/homemta.jsonc")
+        .arg("--pidfile")
+        .arg(&victim)
+        .uid(1000)
+        .output()
+        .expect("run setuid helper");
+    assert!(
+        !out.status.success(),
+        "setuid invocation without --deliver-mbox must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--deliver-mbox"),
+        "stderr must explain the refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !victim.exists(),
+        "no root-side effect may happen before the refusal"
+    );
+}

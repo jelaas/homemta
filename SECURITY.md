@@ -45,6 +45,7 @@ nothing better and is never the automatic first choice.
 | Credentials over plaintext | refused: AUTH is only attempted inside TLS (SMTPS or STARTTLS) |
 | Certificate verification | on by default; `verify: false` is an explicit insecure escape hatch (startup warning now emitted when combined with credentials) |
 | Setuid helper | refuses uid 0 and `never_users`; requires euid 0 at entry (fail-closed if not installed setuid); drops supplementary groups; cleans environment |
+| Setuid invocation gating | **fixed:** a setuid invocation (real uid ≠ 0, euid 0) is only allowed in `--deliver-mbox` mode; running the daemon/queue/pidfile startup path via the setuid bit is refused (it would otherwise be a root file-write primitive via `--pidfile`) |
 | Config file | must be root-owned and not group/world-writable: **fatal** in the helper, warning in the daemon |
 
 **Residual:** credentials are stored in plaintext in the config file;
