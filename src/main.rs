@@ -158,19 +158,51 @@ fn load_config_strict(path: &str, strict: bool) -> Config {
 }
 
 fn usage() -> ! {
-    eprintln!(
-        "usage: homemta [options]\n\
-         options:\n\
-         \x20 -c FILE   configuration file (default /etc/homemta.jsonc)\n\
-         \x20 -b        run as a background daemon (double fork, detach)\n\
-         \x20 --pidfile FILE  write the daemon pid to FILE (init scripts)\n\
-         \x20 -q        run the queue once and exit\n\
-         \x20 -d        debug logging to stderr\n\
-         \x20 -V        show version and exit\n\
-         \x20 --exit-on-stdin-eof  shut down when stdin closes (supervisors/tests)\n\
-         \x20 --deliver-mbox USER  internal: setuid delivery helper mode"
-    );
+    eprintln!("usage: homemta [options]  (try `homemta -h` for help)");
     std::process::exit(1);
+}
+
+fn help() -> ! {
+    print!(
+        r#"homemta - minimal home-server MTA (IPv4 only, static musl build)
+
+USAGE:
+    homemta [options]
+
+OPTIONS:
+    -c FILE           read the JSONC configuration from FILE
+                      (default: /etc/homemta.jsonc)
+    -b                detach from the terminal and run as a background daemon
+    --pidfile FILE    write the daemon PID to FILE once the listeners are up;
+                      removed again on clean shutdown (for init scripts)
+    -q                process the outgoing queue once and exit (e.g. from cron)
+    -d                debug mode: mirror the log to stderr as well
+    -V                print the version and exit
+    -h, --help        show this help and exit
+    --exit-on-stdin-eof
+                      shut down when stdin closes (for supervisors and tests;
+                      ignored in daemon mode)
+
+INTERNAL - used by the setuid delivery helper, not meant for direct use:
+    --deliver-mbox USER
+                      append a message (envelope + body read from stdin) to
+                      USER's mailbox, running as USER. This mode is invoked
+                      by homemta itself through the setuid-root helper
+                      binary (homemta-deliver). It requires root, validates
+                      the target user and the config file, and refuses root
+                      and never_users. There is no need to call it manually.
+
+MAIL FLOW:
+    Inbound SMTP on the configured ports is accepted only for local domains
+    (no open relaying). Everything else is sent through the configured
+    smarthost. Local mail is delivered to mbox files under mailbox_dir.
+    The daemon starts as root to bind port 25, then drops to the
+    configured unprivileged user.
+
+See README.md for configuration and SECURITY.md for the security audit.
+"#
+    );
+    std::process::exit(0);
 }
 
 fn euid() -> u32 {
@@ -377,7 +409,7 @@ fn main() {
                 println!("homemta {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-            "-h" | "--help" => usage(),
+            "-h" | "--help" => help(),
             _ => usage(),
         }
     }
