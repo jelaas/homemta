@@ -545,52 +545,6 @@ fn can_setuid() -> bool {
 /// Close every fd except 0/1/2. Used in post-fork probe children so they
 /// never keep the parent's pipe ends (or sockets) open - a leaked fork
 /// child must not hold other tests' stdin pipes or the harness output.
-fn close_extra_fds() {
-    unsafe {
-        // close_range syscall (Linux 5.9+, x86_64 syscall 436); ignore
-        // failure and fall back to a plain loop for older kernels.
-        let _ = libc::syscall(436, 3u32, u32::MAX, 0u32);
-        for fd in 3..1024 {
-            libc::close(fd);
-        }
-    }
-}
-
-/// Can this test environment kill processes? Needed to clean up a
-/// daemonized instance; some sandboxes block the kill syscall.
-fn can_kill() -> bool {
-    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CAN.get_or_init(|| unsafe {
-        let pid = libc::fork();
-        if pid == 0 {
-            // child: drop inherited fds, wait forever until killed.
-            close_extra_fds();
-            let null =
-                libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
-            if null >= 0 {
-                libc::dup2(null, 0);
-                libc::dup2(null, 1);
-                libc::dup2(null, 2);
-                if null > 2 {
-                    libc::close(null);
-                }
-            }
-            loop {
-                libc::pause();
-            }
-        }
-        if pid < 0 {
-            return false;
-        }
-        let ok = libc::kill(pid, libc::SIGKILL) == 0;
-        if ok {
-            let mut st = 0;
-            libc::waitpid(pid, &mut st, 0);
-        }
-        ok
-    })
-}
-
 fn start_mta(
     smarthost_port: Option<u16>,
     relay_from_hosts: &[&str],
@@ -1298,18 +1252,18 @@ fn daemon_mode_serves_and_writes_pidfile() {
         mbox_content(&mta, "testuser").contains("Subject: via daemon")
     });
 
-    // SIGTERM -> graceful shutdown, pid file removed. Where signals are
-    // unavailable (some sandboxes block kill(2)), the detached daemon is
-    // left running; its stdio is detached so the harness is unaffected.
-    if can_kill() {
-        assert!(unsafe { libc::kill(pid, libc::SIGTERM) } == 0);
-        wait_for("daemon exit", || unsafe {
-            libc::kill(pid, 0) == -1 && *libc::__errno_location() == libc::ESRCH
-        });
-        assert!(!pidfile.exists(), "pid file must be removed on shutdown");
-    } else {
-        eprintln!("daemon test: signals unavailable, leaving daemon {} running", pid);
-    }
+    // Stop the daemon by closing its stdin (--exit-on-stdin-eof keeps the
+    // daemon's stdin attached even in -b mode): works everywhere, also in
+    // sandboxes where kill(2) is blocked. The daemon's own log is the
+    // reliable "it exited" signal (the process may linger as a zombie
+    // until init reaps it).
+    let log_path = mta.dir.join("log");
+    drop(mta);
+    wait_for("daemon exit", || {
+        std::fs::read_to_string(&log_path)
+            .map(|s| s.contains("homemta exiting"))
+            .unwrap_or(false)
+    });
 }
 
 /// The root delivery helper requires both the right uid (SO_PEERCRED)

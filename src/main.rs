@@ -16,10 +16,12 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     queue::request_shutdown();
 }
 
-/// Detach from the terminal: double-fork, new session, stdin from
-/// /dev/null. stdout/stderr stay attached until logging is initialized so
-/// startup errors remain visible; see detach_stdio().
-fn daemonize() {
+/// Detach from the terminal: double-fork, new session. stdout/stderr stay
+/// attached until logging is initialized so startup errors remain
+/// visible; see detach_stdio(). When `keep_stdin` is set (--exit-on-stdin-
+/// eof), stdin is left attached too so a supervisor can stop the daemon
+/// by closing it.
+fn daemonize(keep_stdin: bool) {
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
@@ -44,15 +46,17 @@ fn daemonize() {
         if pid > 0 {
             std::process::exit(0);
         }
-        // Grandchild: detach stdin.
-        let null = libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_RDONLY,
-        );
-        if null >= 0 {
-            libc::dup2(null, 0);
-            if null > 2 {
-                libc::close(null);
+        // Grandchild: detach stdin unless a supervisor needs it.
+        if !keep_stdin {
+            let null = libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY,
+            );
+            if null >= 0 {
+                libc::dup2(null, 0);
+                if null > 2 {
+                    libc::close(null);
+                }
             }
         }
     }
@@ -84,7 +88,16 @@ fn write_pidfile(cfg: &Config) {
 
 fn remove_pidfile(cfg: &Config) {
     if let Some(p) = &cfg.pid_file {
-        let _ = std::fs::remove_file(p);
+        // Runs after the privilege drop; the directory (e.g. /run) may not
+        // be writable by the daemon user. Tell the operator instead of
+        // failing silently.
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) => log::warn(&format!(
+                "cannot remove pid file {}: {} (remove it in the stop script)",
+                p, e
+            )),
+        }
     }
 }
 
@@ -169,7 +182,7 @@ OPTIONS:
     -h, --help        show this help and exit
     --exit-on-stdin-eof
                       shut down when stdin closes (for supervisors and tests;
-                      ignored in daemon mode)
+                      works with -b: stdin stays attached in that case)
 
 MAIL FLOW:
     Inbound SMTP on the configured ports is accepted only for local domains
@@ -420,7 +433,7 @@ fn main() {
     // stdout/stderr remain attached until logging is initialized below, so
     // startup errors (e.g. a broken config) still reach the terminal.
     if daemon_mode {
-        daemonize();
+        daemonize(exit_on_stdin_eof);
     }
 
     let mut cfg = load_config(&config_path);
@@ -517,8 +530,7 @@ fn main() {
     // Test/debug helper: shut down when stdin reaches EOF. Lets supervisors
     // (and the integration tests) stop the daemon without signalling it,
     // which matters in sandboxes where the kill syscall is unavailable.
-    // Meaningless in daemon mode (stdin is /dev/null).
-    if exit_on_stdin_eof && !daemon_mode {
+    if exit_on_stdin_eof {
         let stdin_wake = wake_tx.clone();
         std::thread::spawn(move || {
             use std::io::Read;
