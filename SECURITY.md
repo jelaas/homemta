@@ -1,139 +1,151 @@
 # Security audit
 
-This document records the security review of homemta: what was examined,
+This document records the security reviews of homemta: what was examined,
 what was found and fixed, and the residual risks that remain by design.
-Last reviewed: 2026-11-25 (commit `3bbf7a5`..`security-audit`).
+Last reviewed: 2026-11-26 (post IPC redesign; see git history for the
+earlier setuid-binary review).
 
 ## Threat model
 
-- The **daemon** starts as root (bind :25, prepare state) and drops to an
-  unprivileged user (`user`/`group`); all SMTP, queue and spool work runs
-  unprivileged.
-- A **forked root helper process** (created before the privilege drop) is
-  the only code path that retains privileges. It listens on a private
-  abstract unix socket, accepts connections only from the daemon's own
-  runtime uid (SO_PEERCRED), and only to become the mailbox owner for
-  local delivery. No setuid binary exists.
+- The **daemon** starts as root (bind :25, prepare state), forks the
+  delivery helper, then drops to an unprivileged user (`user`/`group`);
+  all SMTP, queue and spool work runs unprivileged.
+- A **forked root helper process** is the only code path that retains
+  privileges. It listens on a private abstract unix socket and serves
+  only the daemon's own connections; for each request it becomes the
+  mailbox owner, then exits. No setuid binary exists.
 - Untrusted input arrives from: remote SMTP peers (HELO/MAIL/RCPT/DATA),
   the smarthost's SMTP/TLS responses, DNS results, `/etc/aliases`,
-  `~/.forward`, and (indirectly) message content echoed into bounces.
+  `~/.forward`, local users who can connect to the helper socket, and
+  (indirectly) message content echoed into bounces.
 - Trusted (root-controlled) inputs: the JSONC config, `/etc/passwd`,
   `/etc/group`, TLS keys, the spool directory.
 
-## Reviewed areas and findings
+## Interprocess communication
 
-### 1. Cryptography
+### Delivery helper socket (abstract unix socket)
 
-| area | status |
+| property | status |
 | --- | --- |
-| SHA-256, HMAC-SHA-256, PBKDF2-HMAC-SHA-256 | hand-written; verified against RFC 6234/4231 vectors and cross-checked with Python hashlib |
-| SCRAM-SHA-256 (RFC 7677) | client proof + server signature verified both ways against the RFC 5802/7677 exchange (recomputed with SHA-256); server nonce extension is enforced (downgrade/MITM detection) |
-| MD5 (CRAM-MD5) | legacy mechanism, kept only for smarthost compatibility; never selected when SCRAM-SHA-256 is offered |
-| Randomness | /dev/urandom for nonces, message-ids and bounce boundaries; deterministic fallback only if /dev/urandom is unreadable |
-| TLS | rustls + ring; TLS 1.2/1.3; certificate verification against the configured CA bundle; no OpenSSL, no system trust store |
+| Name | 160-bit random, bound in the abstract namespace |
+| Name visibility | **not** a secret: abstract socket names are listed in `/proc/net/unix` for all users, and any process knowing the name can `connect()` (abstract sockets have no owner/permissions) |
+| Factor 1 - SO_PEERCRED | checked in the helper parent *before* forking: the connecting process's real uid must equal the daemon's runtime uid (or 0 when the daemon deliberately runs as root) |
+| Factor 2 - shared secret | a 256-bit random value generated before the fork, shared by fork inheritance only (never argv/env/logs); the first request line must match it, compared in constant time |
+| Request framing | every line length-capped (1 KiB); message capped at 128 MiB; the client half-closes so the helper can read to EOF and reply |
+| Response | `OK` / `ERR <reason>`, single line; the daemon caps its reply read |
+| Concurrency | helper children capped at 32; per-child I/O timeouts (30 s) |
+| Shutdown | life-line pipe: the write end exists only in the daemon, so when the daemon exits (any cause) the helper's poll sees POLLHUP and exits; no orphaned root process |
+| Fork safety | the helper is forked while the daemon is still single-threaded, and is itself single-threaded, so its per-request `fork()` is safe |
 
-**Fixed:** SCRAM proof/signature comparisons now use a constant-time
-comparison (`ct_eq`).
+**Reviewed scenarios**
 
-**Residual:** CRAM-MD5 is weak by modern standards (MD5, no channel
-binding). It exists only for compatibility with smarthosts that offer
-nothing better and is never the automatic first choice.
+- *Arbitrary local user connects*: refused by SO_PEERCRED before any
+  parsing or fork (cheap).
+- *Same-uid process connects* (e.g. another `mail` service): fails the
+  secret check in the forked child (constant-time), no delivery, logged.
+- *Root connects when the daemon runs as root*: the secret is the only
+  remaining factor; root could also read the daemon's memory directly,
+  so this is defence in depth, not a boundary against root.
+- *Same-uid process with ptrace access*: could extract the secret, but
+  already passes SO_PEERCRED; the secret protects against same-uid
+  processes that are *not* fully compromised.
+- *Connection floods*: non-matching uids are rejected pre-fork; matching
+  uids are bounded by MAX_CHILDREN and 30 s timeouts. Residual: a
+  malicious same-uid process can still slow local deliveries (see below).
+- *Stale zombies*: helper delivery children are reaped on each loop
+  iteration (waitpid WNOHANG); a zombie may linger until the next event -
+  cosmetic, no resource growth.
 
-### 2. Authentication
+### Daemon - helper protocol (untrusted data)
 
-| area | status |
-| --- | --- |
-| Smarthost auth | SCRAM-SHA-256, CRAM-MD5, PLAIN, LOGIN, XOAUTH2; `auto` prefers the strongest offered mechanism |
-| Credentials over plaintext | refused: AUTH is only attempted inside TLS (SMTPS or STARTTLS) |
-| Certificate verification | on by default; `verify: false` is an explicit insecure escape hatch (startup warning now emitted when combined with credentials) |
-| Delivery helper process | forked while root, before the privilege drop; refuses uid 0 and `never_users`; drops supplementary groups and the target privileges before touching any file |
-| Helper socket access | two factors: the connection's SO_PEERCRED uid must equal the daemon's runtime uid, and the request's first line must match a 256-bit secret shared with the helper (fork inheritance; never in argv/env/logs; constant-time comparison). The random abstract socket name is defence in depth, not the boundary |
-| Config file | must be root-owned and not group/world-writable: **fatal** in the helper, warning in the daemon |
+Everything the helper receives is treated as untrusted:
 
-**Residual:** credentials are stored in plaintext in the config file;
-protect it with `0600 root:root`. XOAUTH2 tokens expire and must be
-rotated externally.
+- Config re-read per request, must be root-owned and not group/world
+  writable (`file_is_secure`), parse warnings are fatal.
+- User name: length-capped, must exist in the (root-owned) passwd file,
+  refused if uid 0, in `never_users`, or containing `/`, `.`, `..`.
+- Envelope and message: length-capped; privileges are dropped *before*
+  any file is touched; the mailbox open is `O_NOFOLLOW` and locked.
+- **Fixed:** the shared mbox writer now also strips control characters
+  from the envelope strings before writing `From_`/`Return-path:`/
+  `Envelope-to:` lines, so a compromised daemon cannot inject mbox
+  lines or headers through the helper.
+- Helper-side error paths always reply `ERR ...` (never crash on input).
 
-### 3. Untrusted input handling
+### Other IPC
+
+- **Life-line pipe**: write end held only by the daemon; delivery
+  children close their inherited ends. No fd duplication into spawned
+  pipe commands (std marks non-stdio fds close-on-exec).
+- **Signals**: SIGTERM/SIGINT only set a shutdown flag (async-signal-
+  safe); SIGHUP/SIGPIPE ignored; handlers installed before the helper
+  fork and inherited harmlessly.
+- **stdin (supervisor hook)**: `--exit-on-stdin-eof` works in daemon
+  mode; stdin data is read and discarded, EOF triggers clean shutdown.
+- **Spool flock**: prevents concurrent daemons/queue-runners on the same
+  spool.
+
+## Untrusted input handling (SMTP)
+
+**Fixed in the previous audit, still in place:**
+
+- Symlink/TOCTOU: `O_NOFOLLOW` + `fchown` on mailbox and alias-file
+  deliveries; path-traversal user names refused.
+- HELO/EHLO validation (header injection into `Received:`).
+- Bounce generation: control-character truncation of addresses/reasons,
+  unpredictable multipart boundary.
+- Spool directory chowned to the daemon user, mode 0700.
+- `max_sessions` (default 64) connection-flood cap; 8 KiB line cap;
+  `max_message_size`; NUL rejection; dot-stuffing; RFC address
+  validation (control chars, spaces, metacharacters, length limits);
+  ACL local-part restrictions; no open relaying (CIDR-aware
+  `relay_from_hosts`); VRFY/EXPN disabled; alias/forward loop detection;
+  bounces never bounce; atomic spool writes.
 
 **Fixed in this audit:**
 
-- **Symlink attacks on mailboxes** (CWE-59/TOCTOU): `open()` on
-  `/var/spool/mail/<user>` and alias/forward file targets now uses
-  `O_NOFOLLOW`, and ownership changes use `fchown` on the open handle
-  instead of `chown` on the path. A local attacker with write access to
-  the mailbox directory can no longer redirect delivery into arbitrary
-  files (e.g. `/root/.ssh/authorized_keys`).
-- **HELO/EHLO header injection**: the HELO argument is echoed into the
-  `Received:` header. It is now validated (alphanumerics, `. - [ ] :`
-  only); embedded CR/LF, spaces and controls are rejected with 501.
-- **Bounce header injection**: failure reasons (smarthost reply text) and
-  envelope addresses are truncated at the first control character before
-  being placed into bounce headers.
-- **Bounce MIME smuggling**: the multipart boundary is now unpredictable
-  (random per bounce), so attacker-influenced message content cannot
-  guess the boundary and smuggle MIME parts out of the `message/rfc822`
-  attachment.
-- **Spool privacy**: the spool directory is chowned to the daemon user
-  and set `0700` (it contains complete message bodies).
-- **Connection floods**: `max_sessions` (default 64) caps concurrent SMTP
-  sessions; excess connections get `421` instead of consuming threads.
-- **Path traversal via passwd names**: user names are checked for `/`,
-  `.`, `..` before being used as file-name components.
+- mbox envelope sanitization at the shared writer (see above).
+- Capped reply-line read on the daemon side of the helper socket.
 
-**Already in place (verified, not changed):**
+## Cryptography
 
-- Address parsing rejects control characters, spaces and metacharacters
-  in local parts; domains are restricted to `[A-Za-z0-9.-]` plus
-  bracketed literals; length limits (64/254) enforced.
-- Line-length cap (8 KiB), message-size cap (`max_message_size`), NUL
-  byte rejection, dot-stuffing/destuffing per RFC 5321.
-- ACL-style local-part restrictions (leading dots, `@ % ! / |`, `/../`)
-  per recipient class.
-- No open relaying: non-local recipients only from `relay_from_hosts`
-  (exact IPs or CIDR), and only via the smarthost.
-- `VRFY`/`EXPN` disabled (no user enumeration); `550 Unknown user` only
-  for local domains where the user truly does not exist.
-- Received/Message-ID/From headers are generated internally; the
-  Message-ID is random.
-- Alias/forward expansion has loop detection (`check_ancestor`
-  equivalent).
-- Bounces never bounce: envelope sender of a bounce is empty, and failing
-  bounces are frozen then removed.
-- Spool files are written atomically (temp + rename) and parsed from a
-  directory only the daemon user can write.
-- Session idle timeout (300 s), bounded queue-retry schedule.
+| area | status |
+| --- | --- |
+| SHA-256, HMAC-SHA-256, PBKDF2-HMAC-SHA-256 | RFC-vector tested, cross-checked with Python hashlib |
+| SCRAM-SHA-256 | client proof + server signature verified against the RFC 5802/7677 exchange; nonce extension enforced; constant-time comparisons |
+| MD5 (CRAM-MD5) | legacy compatibility only; never selected when SCRAM is offered |
+| Randomness | /dev/urandom for socket name, shared secret, nonces, message-ids, bounce boundaries |
+| TLS | rustls + ring, TLS 1.2/1.3, certificate verification against the configured CA bundle |
 
-## Residual risks and limitations (by design)
+## Authentication
 
-- **No DANE/MTA-STS**: STARTTLS is opportunistic for inbound connections;
-  a MITM can strip it (standard for classic MTAs).
-- **No SASL server side**: incoming connections are authenticated only by
-  source IP (`relay_from_hosts`). Submission from untrusted networks is
-  not supported.
-- **TLS session limits**: a TLS handshake consumes a session slot for up
-  to the session timeout; bounded by `max_sessions`.
-- **`verify: false`** disables smarthost certificate validation entirely;
-  combined with password auth it exposes credentials to a MITM (warned at
-  startup).
-- **Aliases pipes and file targets** execute commands as the daemon user;
-  `/etc/aliases` must be root-controlled (pipes in `~/.forward` are an
-  intended user feature).
-- **Single process**: no chroot/jail; a daemon compromise is bounded by
-  the unprivileged user, the helper's fixed paths and
-  `never_users`, but not by a sandbox.
-- **No TLS client certificate** authentication for the smarthost.
-- JSONC parser recursion depth is bounded only by config-file size
-  (config is root-controlled).
+- Smarthost: SCRAM-SHA-256 preferred, then CRAM-MD5, PLAIN, LOGIN,
+  XOAUTH2; credentials only ever sent inside TLS; `verify: false` +
+  credentials triggers a startup warning.
+- Config file must be root-owned and not group/world-writable (fatal in
+  the helper, warning in the daemon).
+
+## Residual risks (by design)
+
+- **Local-delivery DoS**: a malicious process sharing the daemon's uid
+  can occupy helper slots (32 x 30 s) and slow local delivery. It cannot
+  escalate beyond the daemon's own capabilities.
+- **Helper overload bounces**: when all helper children are busy the
+  daemon gets an error and bounces the message instead of deferring
+  (home-server scale; a deferred-queue redesign is out of scope).
+- No DANE/MTA-STS (opportunistic inbound STARTTLS); no SASL server side
+  (inbound trust = source IP); single process without chroot/jail;
+  credentials in plaintext in the root-owned config; JSONC parser
+  recursion bounded only by config size (config is root-controlled).
+- The debug log (`-d`) prints the helper socket name (not the secret);
+  with the default log file mode any local user could learn the name -
+  irrelevant, since uid + secret are the boundary.
 
 ## Operational recommendations
 
-1. Keep the config `0600 root:root` (enforced as a warning/fatal error).
-2. No separate setuid binary exists; keep the config root-owned and the
-   binary out of user-writable filesystems.
-3. Alias `root` and `postmaster` to a real admin account; never rely on
-   direct root mailbox delivery (refused by `never_users`).
-4. Use `smarthost.verify: true` and an up-to-date CA bundle.
-5. Run the daemon with `user: mail` (or a dedicated account); give the
-   spool directory no group/other access.
-6. Keep `max_message_size` and `max_sessions` at sane values.
+1. Keep the config `0600 root:root`; restrict the log file if `-d` is
+   used in production.
+2. Alias `root` and `postmaster` to a real admin account.
+3. Use `smarthost.verify: true` with an up-to-date CA bundle.
+4. Run with `user: mail` (or a dedicated account); spool `0700`.
+5. Keep `max_message_size` and `max_sessions` at sane values.

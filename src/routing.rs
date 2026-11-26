@@ -350,7 +350,17 @@ pub fn append_mbox(
         }
     }
 
-    let from_sender = if sender.is_empty() { "MAILER-DAEMON" } else { sender };
+    // The envelope strings come from two paths (validated SMTP input, or
+    // the helper socket request from the daemon). Defence in depth: strip
+    // anything that could break out of a header or the From_ line.
+    let clean = |s: &str| {
+        s.chars()
+            .take_while(|c| *c >= ' ' && *c != '\u{7f}')
+            .collect::<String>()
+    };
+    let sender = clean(sender);
+    let rcpt_full = clean(rcpt_full);
+    let from_sender = if sender.is_empty() { "MAILER-DAEMON".to_string() } else { sender.clone() };
     let head = format!(
         "From {} {}\n\
          Return-path: <{}>\n\
@@ -425,11 +435,17 @@ fn deliver_mbox_via_helper(
     // the same connection.
     let _ = writer.shutdown(std::net::Shutdown::Write);
     drop(writer);
-    let mut resp = String::new();
     let mut rd = std::io::BufReader::new(stream);
-    if rd.read_line(&mut resp).map_err(|e| e.to_string())? == 0 {
-        return Err("delivery helper closed the connection".to_string());
-    }
+    // Cap the helper's reply line (the helper is trusted, but never let a
+    // stream dictate an unbounded allocation).
+    let resp = {
+        let mut limited = rd.by_ref().take(1025);
+        let mut line = String::new();
+        if limited.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            return Err("delivery helper closed the connection".to_string());
+        }
+        line
+    };
     let resp = resp.trim_end_matches(['\r', '\n']).trim().to_string();
     if resp == "OK" {
         Ok(())
@@ -661,6 +677,38 @@ mod tests {
         assert!(content.starts_with("From sender@example.org "));
         assert_eq!(content.matches("\nFrom b@c ").count(), 1);
         assert_eq!(content.matches("Return-path:").count(), 2);
+    }
+
+    #[test]
+    fn mbox_envelope_sanitization() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let c = test_cfg(&tmp);
+        let cfg = Arc::new(c);
+        let user = getpwnam(&cfg, "jelaas").unwrap();
+        // A hostile envelope (as a compromised daemon could send via the
+        // helper socket) must not be able to inject mbox lines/headers.
+        // The SMTP/daemon path rejects such envelopes up front; here we
+        // exercise the shared mbox writer directly (the layer the helper
+        // process trusts if the daemon were compromised).
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp.join("mail").join("jelaas"))
+            .unwrap();
+        append_mbox(
+            &mut f,
+            "evil@sender.example\nX-Injected: yes\r\nFrom fake",
+            "jelaas@jelaas.eu\nMore: injected",
+            b"Subject: clean\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.join("mail").join("jelaas")).unwrap();
+        assert!(!content.contains("X-Injected"), "header injection in mbox");
+        assert!(!content.contains("More: injected"), "header injection in mbox");
+        assert!(content.contains("evil@sender.example"), "sender prefix kept");
+        assert!(content.contains("jelaas@jelaas.eu"), "recipient prefix kept");
+        let _ = user;
     }
 
     #[test]
