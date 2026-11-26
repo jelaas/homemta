@@ -75,6 +75,9 @@ pub struct Config {
     /// Abstract unix socket name of the forked root delivery helper
     /// (set at startup, not from the file).
     pub helper_socket: Option<String>,
+    /// Shared secret for the delivery helper connection (set at startup,
+    /// not from the file). Verifies the caller in addition to SO_PEERCRED.
+    pub helper_secret: Option<String>,
     /// Maximum concurrent SMTP sessions (protects against connection
     /// floods; extra connections get 421).
     pub max_sessions: usize,
@@ -121,6 +124,7 @@ impl Default for Config {
             config_path: String::new(),
             pid_file: None,
             helper_socket: None,
+            helper_secret: None,
             max_sessions: 64,
             queue_interval: 30,
             retry_first_interval: 900,

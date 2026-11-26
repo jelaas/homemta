@@ -47,7 +47,7 @@ nothing better and is never the automatic first choice.
 | Credentials over plaintext | refused: AUTH is only attempted inside TLS (SMTPS or STARTTLS) |
 | Certificate verification | on by default; `verify: false` is an explicit insecure escape hatch (startup warning now emitted when combined with credentials) |
 | Delivery helper process | forked while root, before the privilege drop; refuses uid 0 and `never_users`; drops supplementary groups and the target privileges before touching any file |
-| Helper socket access | accepts only connections whose SO_PEERCRED uid equals the daemon's runtime uid; the random abstract socket name is defence in depth, not the boundary |
+| Helper socket access | two factors: the connection's SO_PEERCRED uid must equal the daemon's runtime uid, and the request's first line must match a 256-bit secret shared with the helper (fork inheritance; never in argv/env/logs; constant-time comparison). The random abstract socket name is defence in depth, not the boundary |
 | Config file | must be root-owned and not group/world-writable: **fatal** in the helper, warning in the daemon |
 
 **Residual:** credentials are stored in plaintext in the config file;

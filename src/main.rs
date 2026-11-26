@@ -300,7 +300,7 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
         return None;
     }
     // Random, unguessable abstract socket name (defence in depth; the
-    // real boundary is the SO_PEERCRED check in the helper).
+    // real boundary is the SO_PEERCRED check plus the shared secret).
     let mut buf = [0u8; 20];
     let mut ok = false;
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -311,6 +311,18 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
         let seed = log::unix_now().to_le_bytes();
         buf = seed.repeat(3).as_slice()[..20].try_into().unwrap_or([7u8; 20]);
     }
+    // A second factor shared with the helper: the helper accepts a request
+    // only when the first line matches this secret (constant-time). Passed
+    // by fork inheritance; never in argv/env/logs.
+    let mut secret_buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut secret_buf);
+    } else {
+        let seed = log::unix_now().to_le_bytes();
+        secret_buf = seed.repeat(4).as_slice()[..32].try_into().unwrap_or([7u8; 32]);
+    }
+    let secret = homemta::md5::hex(&secret_buf);
     let name = format!("homemta-{}", homemta::base64::encode(&buf));
     use std::os::linux::net::SocketAddrExt;
     let addr = match std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()) {
@@ -348,14 +360,15 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
     if pid == 0 {
         // Helper child: never returns.
         unsafe { libc::close(pipefds[1]) };
-        homemta::helper::serve(listener, pipefds[0], expected_uid, config_path);
+        homemta::helper::serve(listener, pipefds[0], expected_uid, secret, config_path);
     }
     // Parent (daemon): close the listener and the pipe's read end, keep
     // the socket name for connects and the write end as the life-line.
     unsafe { libc::close(pipefds[0]) };
     drop(listener);
     cfg.helper_socket = Some(name.clone());
-    log::info("delivery helper started (root, private socket)");
+    cfg.helper_secret = Some(secret);
+    log::info("delivery helper started (root, private socket, shared secret)");
     // Logged for tests and debugging.
     log::debug(&format!("delivery helper socket: {}", name));
     Some((pipefds[1], pid))

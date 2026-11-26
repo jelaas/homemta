@@ -403,12 +403,22 @@ fn deliver_mbox_via_helper(
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(sock_name.as_bytes())
         .map_err(|e| format!("delivery helper address: {}", e))?;
+    let Some(secret) = &cfg.helper_secret else {
+        return Err(
+            "local delivery unavailable: no delivery helper (was homemta started as root?)"
+                .to_string(),
+        );
+    };
     let stream = UnixStream::connect_addr(&addr)
         .map_err(|e| format!("cannot connect to delivery helper: {}", e))?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    let mut req = format!("{}\n{}\n{}\n", user.name, sender, rcpt_full).into_bytes();
+    let mut req = format!(
+        "{}\n{}\n{}\n{}\n",
+        secret, user.name, sender, rcpt_full
+    )
+    .into_bytes();
     req.extend_from_slice(msg);
     writer.write_all(&req).map_err(|e| format!("delivery helper: {}", e))?;
     // Half-close: the helper reads the message up to EOF, then replies on

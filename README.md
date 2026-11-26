@@ -20,7 +20,8 @@ A minimal MTA for home servers, written in Rust.
 - **Privilege separation without setuid**: the daemon starts as root to
   bind port 25, forks its own root delivery helper (which listens on a
   private abstract unix socket and only serves the daemon's own
-  connections, verified via SO_PEERCRED), then drops to an unprivileged
+  connections, verified via SO_PEERCRED plus a shared secret), then
+  drops to an unprivileged
   user. User-owned mailboxes are written by the helper after it becomes
   the mailbox owner.
 - **Static musl binary.** Two runtime dependencies: `rustls` (TLS, with

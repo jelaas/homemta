@@ -10,8 +10,9 @@ fn xor(a: &mut [u8], b: &[u8]) {
     }
 }
 
-/// Constant-time comparison for digests/signatures.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time comparison for digests/signatures and the delivery
+/// helper's shared secret.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;

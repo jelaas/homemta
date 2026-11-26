@@ -1312,9 +1312,10 @@ fn daemon_mode_serves_and_writes_pidfile() {
     }
 }
 
-/// The root delivery helper only serves connections from the daemon's
-/// runtime uid (verified with SO_PEERCRED): a root peer must be refused,
-/// a daemon-uid peer must be served.
+/// The root delivery helper requires both the right uid (SO_PEERCRED)
+/// and the shared secret: a root peer is refused, and a daemon-uid peer
+/// with a wrong secret is refused. The positive path runs through the
+/// daemon itself (SMTP submission), which knows the secret.
 #[test]
 fn helper_socket_checks_peer_credentials() {
     if !can_setuid() {
@@ -1349,22 +1350,34 @@ fn helper_socket_checks_peer_credentials() {
         .and_then(|l| l.rsplit("delivery helper socket:").next())
         .map(|s| s.trim().to_string())
         .expect("helper socket name");
-    let sock_name = name;
 
     // A root peer (uid 0, not the daemon uid 1000) must be refused.
-    let root_reply = submit_helper_request(&sock_name, 0, "testuser", b"Subject: root peer\r\n\r\nbad\r\n");
+    let root_reply = submit_helper_request(&name, 0, "wrong-secret", "testuser", b"bad");
     assert_ne!(root_reply.as_deref(), Some("OK"), "root peer must be refused");
-    std::thread::sleep(Duration::from_millis(200));
+
+    // A peer with the right uid but a wrong secret must be refused too.
+    let bad_secret = submit_helper_request(&name, 1000, "wrong-secret", "testuser", b"bad");
+    assert_ne!(bad_secret.as_deref(), Some("OK"), "wrong secret must be refused");
+
+    std::thread::sleep(Duration::from_millis(300));
     assert!(
-        !mbox_content(&mta, "testuser").contains("root peer"),
+        !mbox_content(&mta, "testuser").contains("via helper"),
         "no mail may be delivered for a rejected peer"
     );
 
-    // A peer with the daemon's uid must be served.
-    let reply = submit_helper_request(&sock_name, 1000, "testuser", b"Subject: via socket\r\n\r\nhello\r\n");
-    assert_eq!(reply.as_deref(), Some("OK"), "daemon-uid peer must be served");
+    // The positive path: normal SMTP submission goes through the daemon,
+    // which presents the correct secret.
+    let (code, reply) = smtp_submit(
+        mta.port,
+        false,
+        &client_roots(&c.ca),
+        "testuser@test.example",
+        &["testuser@test.example"],
+        &["Subject: via helper", "", "secret auth delivery"],
+    );
+    assert_eq!(code, 250, "submission failed: {:?}", reply);
     wait_for("helper socket delivery", || {
-        mbox_content(&mta, "testuser").contains("Subject: via socket")
+        mbox_content(&mta, "testuser").contains("Subject: via helper")
     });
     // And the mailbox is owned by the user (the helper dropped to uid 1000).
     use std::os::unix::fs::MetadataExt;
@@ -1374,7 +1387,13 @@ fn helper_socket_checks_peer_credentials() {
 
 /// Send one helper request from a forked child running as `uid`; returns
 /// the helper's reply line.
-fn submit_helper_request(sock_name: &str, uid: u32, user: &str, msg: &[u8]) -> Option<String> {
+fn submit_helper_request(
+    sock_name: &str,
+    uid: u32,
+    secret: &str,
+    user: &str,
+    msg: &[u8],
+) -> Option<String> {
     let mut fds = [0i32; 2];
     unsafe { libc::pipe(fds.as_mut_ptr()) };
     let pid = unsafe { libc::fork() };
@@ -1392,7 +1411,7 @@ fn submit_helper_request(sock_name: &str, uid: u32, user: &str, msg: &[u8]) -> O
                 .map_err(|e| e.to_string())?;
             let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
             let mut w = s.try_clone().map_err(|e| e.to_string())?;
-            let mut req = format!("{}\ns@d\nr@d\n", user).into_bytes();
+            let mut req = format!("{}\n{}\ns@d\nr@d\n", secret, user).into_bytes();
             req.extend_from_slice(msg);
             w.write_all(&req).map_err(|e| e.to_string())?;
             let _ = w.shutdown(std::net::Shutdown::Write);

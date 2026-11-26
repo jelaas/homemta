@@ -23,6 +23,9 @@ use std::os::unix::net::UnixListener;
 use std::time::Duration;
 
 const MAX_MSG: u64 = 128 * 1024 * 1024;
+const MAX_LINE: u64 = 1024;
+/// Cap on concurrent delivery children (refuse extra requests).
+const MAX_CHILDREN: i32 = 32;
 
 fn peer_uid(listener_fd: i32) -> Option<u32> {
     unsafe {
@@ -49,9 +52,20 @@ fn send_reply(mut w: &std::os::unix::net::UnixStream, s: &str) {
     let _ = w.flush();
 }
 
-/// Handle one accepted connection. Runs in a forked child: drops to the
-/// target user and appends the message to their mailbox.
-fn process_request(stream: std::os::unix::net::UnixStream, config_path: &str) {
+/// Read one line with a length cap (never trust the peer's framing).
+fn read_capped_line(rd: &mut impl BufRead, buf: &mut String, cap: u64) -> bool {
+    buf.clear();
+    let mut limited = rd.take(cap + 1);
+    match limited.read_line(buf) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => buf.len() as u64 <= cap,
+    }
+}
+
+/// Handle one accepted connection. Runs in a forked child: verifies the
+/// shared secret, drops to the target user and appends the message to
+/// their mailbox.
+fn process_request(stream: std::os::unix::net::UnixStream, secret: &[u8], config_path: &str) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let writer = match stream.try_clone() {
@@ -60,26 +74,28 @@ fn process_request(stream: std::os::unix::net::UnixStream, config_path: &str) {
     };
     let mut rd = BufReader::new(stream);
 
-    let mut read_line = |buf: &mut String| -> Option<()> {
-        buf.clear();
-        match rd.read_line(buf) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(()),
-        }
-    };
-
+    // First line: the shared secret (constant-time comparison).
     let mut line = String::new();
-    if read_line(&mut line).is_none() {
+    if !read_capped_line(&mut rd, &mut line, MAX_LINE) {
+        send_reply(&writer, "ERR truncated request");
+        return;
+    }
+    if !crate::scram::ct_eq(line.trim_end_matches(['\r', '\n']).as_bytes(), secret) {
+        crate::log::warn("delivery helper: refused request with a bad secret");
+        return;
+    }
+
+    if !read_capped_line(&mut rd, &mut line, MAX_LINE) {
         send_reply(&writer, "ERR truncated request");
         return;
     }
     let user_name = line.trim_end_matches(['\r', '\n']).to_string();
-    if read_line(&mut line).is_none() {
+    if !read_capped_line(&mut rd, &mut line, MAX_LINE) {
         send_reply(&writer, "ERR truncated request");
         return;
     }
     let sender = line.trim_end_matches(['\r', '\n']).to_string();
-    if read_line(&mut line).is_none() {
+    if !read_capped_line(&mut rd, &mut line, MAX_LINE) {
         send_reply(&writer, "ERR truncated request");
         return;
     }
@@ -150,10 +166,13 @@ pub fn serve(
     listener: UnixListener,
     life_pipe: std::os::unix::io::RawFd,
     expected_uid: u32,
+    secret: String,
     config_path: String,
 ) -> ! {
     let _ = listener.set_nonblocking(true);
     let listener_fd = listener.as_raw_fd();
+    let secret_bytes = secret.into_bytes();
+    let mut active_children: i32 = 0;
     loop {
         let mut fds = [
             libc::pollfd {
@@ -176,6 +195,7 @@ pub fn serve(
             if unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) } <= 0 {
                 break;
             }
+            active_children -= 1;
         }
         // The daemon closed the life-line pipe (EOF = POLLIN, or the
         // daemon died = POLLHUP; both are reported persistently): shut
@@ -198,15 +218,23 @@ pub fn serve(
             drop(stream);
             continue;
         }
+        if active_children >= MAX_CHILDREN {
+            crate::log::warn("delivery helper: too many concurrent deliveries, refusing");
+            drop(stream);
+            continue;
+        }
+        active_children += 1;
         let config_path = config_path.clone();
+        let secret_bytes = secret_bytes.clone();
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
-                // Child: close the listener and the life-line, serve the
-                // request, exit. Single-threaded, so fork here is safe.
+                // Child: close the listener and the life-line, verify the
+                // secret, serve the request, exit. Single-threaded, so
+                // fork here is safe.
                 drop(listener);
                 let _ = libc::close(life_pipe);
-                process_request(stream, &config_path);
+                process_request(stream, &secret_bytes, &config_path);
                 std::process::exit(0);
             }
         }
