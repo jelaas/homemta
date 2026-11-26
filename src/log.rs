@@ -128,6 +128,13 @@ pub fn warn(msg: &str) {
     emit("-Warning", msg);
 }
 
+/// Raw fd of the log file, if one is configured (used by the delivery
+/// helper to keep exactly the fds it needs when closing inherited ones).
+pub fn file_fd() -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    LOG_FILE.lock().unwrap().as_ref().map(|f| f.as_raw_fd())
+}
+
 pub fn error(msg: &str) {
     emit("**Error", msg);
 }

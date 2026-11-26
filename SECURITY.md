@@ -35,6 +35,7 @@ earlier setuid-binary review).
 | Response | `OK` / `ERR <reason>`, single line; the daemon caps its reply read |
 | Concurrency | helper children capped at 32; per-child I/O timeouts (30 s) |
 | Shutdown | life-line pipe: the write end exists only in the daemon, so when the daemon exits (any cause) the helper's poll sees POLLHUP and exits; no orphaned root process |
+| Inherited fds | the helper child closes every fd inherited from the daemon except stdio, its unix listener, the life-line pipe and the log file - it does not hold the SMTP listeners (port 25) or the spool lock |
 | Fork safety | the helper is forked while the daemon is still single-threaded, and is itself single-threaded, so its per-request `fork()` is safe |
 
 **Reviewed scenarios**

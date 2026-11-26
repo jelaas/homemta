@@ -307,6 +307,7 @@ fn bind_listeners(cfg: &Config) -> Vec<TcpListener> {
 /// from the daemon's runtime uid. Returns (life-line pipe write fd,
 /// helper pid); the pipe is closed on shutdown to stop the helper.
 fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
     if euid() != 0 {
         log::warn("not started as root: local mailbox delivery will be unavailable");
@@ -365,14 +366,33 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
         routing::getpwnam(cfg, &cfg.user).map(|u| u.uid).unwrap_or(u32::MAX)
     };
     let config_path = cfg.config_path.clone();
+    let listener_fd = listener.as_raw_fd();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         log::error("delivery helper: fork failed");
         return None;
     }
     if pid == 0 {
-        // Helper child: never returns.
-        unsafe { libc::close(pipefds[1]) };
+        // Helper child: never returns. First shed every fd inherited from
+        // the daemon except the ones the helper actually needs: stdio, the
+        // unix listener, the life-line pipe and the log file. In
+        // particular the helper must NOT hold the SMTP listeners (port
+        // 25) or the spool lock.
+        unsafe {
+            libc::close(pipefds[1]);
+            let keep = [listener_fd, pipefds[0], log::file_fd().unwrap_or(-1)];
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            let limit = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                limit.rlim_cur as i32
+            } else {
+                65536
+            };
+            for fd in 3..limit.max(3) {
+                if !keep.contains(&fd) {
+                    libc::close(fd);
+                }
+            }
+        }
         homemta::helper::serve(listener, pipefds[0], expected_uid, secret, config_path);
     }
     // Parent (daemon): close the listener and the pipe's read end, keep

@@ -1399,3 +1399,45 @@ fn submit_helper_request(
         Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
     }
 }
+
+/// The root helper must not hold the daemon's fds (SMTP listeners, spool
+/// lock): it only needs stdio, the unix listener, the life-line pipe and
+/// the log file.
+#[test]
+fn helper_does_not_hold_daemon_fds() {
+    let c = setup();
+    let state = Arc::new(Mutex::new(SmarthostState::default()));
+    let (smarthost_port, _sm) = start_smarthost(state.clone(), &["PLAIN"], &c.ca, &c.ca_key);
+    let mta = start_mta(
+        Some(smarthost_port),
+        &["127.0.0.1"],
+        "auto",
+        "",
+        &c.ca_file,
+        &c.cert_file,
+        &c.key_file,
+        &[],
+    );
+    let mta_pid = mta.child.id() as i32;
+    wait_for("helper child visible", || {
+        std::fs::read_to_string(format!("/proc/{}/task/{}/children", mta_pid, mta_pid))
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    });
+    let children =
+        std::fs::read_to_string(format!("/proc/{}/task/{}/children", mta_pid, mta_pid)).unwrap();
+    let helper_pid: i32 = children.split_whitespace().next().unwrap().parse().unwrap();
+    let mta_fds = std::fs::read_dir(format!("/proc/{}/fd", mta_pid)).unwrap().count();
+    let helper_fds = std::fs::read_dir(format!("/proc/{}/fd", helper_pid)).unwrap().count();
+    assert!(
+        helper_fds < mta_fds,
+        "helper must hold fewer fds than the daemon (helper {}, daemon {})",
+        helper_fds,
+        mta_fds
+    );
+    assert!(
+        helper_fds <= 6,
+        "helper should only hold stdio, unix listener, life-line pipe and log file (got {})",
+        helper_fds
+    );
+}
