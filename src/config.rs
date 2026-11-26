@@ -65,8 +65,6 @@ pub struct Config {
     pub user: String,
     /// Group for the daemon (defaults to the user's primary gid).
     pub group: Option<String>,
-    /// Setuid-root helper used to deliver user-owned mailboxes.
-    pub deliver_helper: String,
     /// Never run a delivery as these users (the classic never_users rule).
     pub never_users: Vec<String>,
     /// Path of the loaded config file (set at startup, not from the file).
@@ -74,6 +72,9 @@ pub struct Config {
     /// Optional pid file written after startup and removed on shutdown
     /// (also settable via --pidfile).
     pub pid_file: Option<String>,
+    /// Abstract unix socket name of the forked root delivery helper
+    /// (set at startup, not from the file).
+    pub helper_socket: Option<String>,
     /// Maximum concurrent SMTP sessions (protects against connection
     /// floods; extra connections get 421).
     pub max_sessions: usize,
@@ -116,10 +117,10 @@ impl Default for Config {
             tls_key: None,
             user: "mail".to_string(),
             group: None,
-            deliver_helper: "/usr/local/libexec/homemta-deliver".to_string(),
             never_users: vec!["root".to_string()],
             config_path: String::new(),
             pid_file: None,
+            helper_socket: None,
             max_sessions: 64,
             queue_interval: 30,
             retry_first_interval: 900,
@@ -234,12 +235,11 @@ impl Config {
                     Json::Null => Ok(self.group = None),
                     _ => want_str(key, v).map(|s| self.group = Some(s)),
                 },
-                "deliver_helper" => want_str(key, v).map(|s| self.deliver_helper = s),
-                "never_users" => want_str_list(key, v).map(|l| self.never_users = l),
                 "pid_file" => match v {
                     Json::Null => Ok(self.pid_file = None),
                     _ => want_str(key, v).map(|s| self.pid_file = Some(s)),
                 },
+                "never_users" => want_str_list(key, v).map(|l| self.never_users = l),
                 "max_sessions" => want_u64(key, v).and_then(|n| {
                     if n > 0 && n <= 65536 {
                         self.max_sessions = n as usize;
@@ -448,6 +448,34 @@ pub fn hostname() -> String {
         }
     }
     "localhost".to_string()
+}
+
+impl Config {
+    /// Load and parse a config file. Returns the first parse warning as an
+    /// error (used by the delivery helper, which must fail closed).
+    pub fn from_file(path: &str) -> Result<Config, String> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+        let mut c = Config::default();
+        let warnings = c.parse(&text);
+        if let Some(w) = warnings.first() {
+            return Err(w.clone());
+        }
+        c.config_path = path.to_string();
+        Ok(c)
+    }
+}
+
+/// A config file is only trustworthy when owned by root and not writable
+/// by group/other (the root delivery helper relies on it).
+pub fn file_is_secure(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            use std::os::unix::fs::MetadataExt;
+            md.uid() == 0 && md.mode() & 0o022 == 0
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

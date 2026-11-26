@@ -9,9 +9,11 @@ Last reviewed: 2026-11-25 (commit `3bbf7a5`..`security-audit`).
 - The **daemon** starts as root (bind :25, prepare state) and drops to an
   unprivileged user (`user`/`group`); all SMTP, queue and spool work runs
   unprivileged.
-- A **setuid-root helper** (`homemta-deliver`) is the only code path that
-  regains privileges, and only to become the mailbox owner for local
-  delivery.
+- A **forked root helper process** (created before the privilege drop) is
+  the only code path that retains privileges. It listens on a private
+  abstract unix socket, accepts connections only from the daemon's own
+  runtime uid (SO_PEERCRED), and only to become the mailbox owner for
+  local delivery. No setuid binary exists.
 - Untrusted input arrives from: remote SMTP peers (HELO/MAIL/RCPT/DATA),
   the smarthost's SMTP/TLS responses, DNS results, `/etc/aliases`,
   `~/.forward`, and (indirectly) message content echoed into bounces.
@@ -44,8 +46,8 @@ nothing better and is never the automatic first choice.
 | Smarthost auth | SCRAM-SHA-256, CRAM-MD5, PLAIN, LOGIN, XOAUTH2; `auto` prefers the strongest offered mechanism |
 | Credentials over plaintext | refused: AUTH is only attempted inside TLS (SMTPS or STARTTLS) |
 | Certificate verification | on by default; `verify: false` is an explicit insecure escape hatch (startup warning now emitted when combined with credentials) |
-| Setuid helper | refuses uid 0 and `never_users`; requires euid 0 at entry (fail-closed if not installed setuid); drops supplementary groups; cleans environment |
-| Setuid invocation gating | **fixed:** a setuid invocation (real uid ≠ 0, euid 0) is only allowed in `--deliver-mbox` mode; running the daemon/queue/pidfile startup path via the setuid bit is refused (it would otherwise be a root file-write primitive via `--pidfile`) |
+| Delivery helper process | forked while root, before the privilege drop; refuses uid 0 and `never_users`; drops supplementary groups and the target privileges before touching any file |
+| Helper socket access | accepts only connections whose SO_PEERCRED uid equals the daemon's runtime uid; the random abstract socket name is defence in depth, not the boundary |
 | Config file | must be root-owned and not group/world-writable: **fatal** in the helper, warning in the daemon |
 
 **Residual:** credentials are stored in plaintext in the config file;
@@ -118,7 +120,7 @@ rotated externally.
   `/etc/aliases` must be root-controlled (pipes in `~/.forward` are an
   intended user feature).
 - **Single process**: no chroot/jail; a daemon compromise is bounded by
-  the unprivileged user, the setuid helper's fixed paths and
+  the unprivileged user, the helper's fixed paths and
   `never_users`, but not by a sandbox.
 - **No TLS client certificate** authentication for the smarthost.
 - JSONC parser recursion depth is bounded only by config-file size
@@ -127,8 +129,8 @@ rotated externally.
 ## Operational recommendations
 
 1. Keep the config `0600 root:root` (enforced as a warning/fatal error).
-2. Install `homemta-deliver` setuid root only from trusted builds; keep it
-   outside user-writable filesystems.
+2. No separate setuid binary exists; keep the config root-owned and the
+   binary out of user-writable filesystems.
 3. Alias `root` and `postmaster` to a real admin account; never rely on
    direct root mailbox delivery (refused by `never_users`).
 4. Use `smarthost.verify: true` and an up-to-date CA bundle.

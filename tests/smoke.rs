@@ -626,20 +626,10 @@ fn start_mta(
     std::fs::write(dir.join("piped-out"), "").unwrap();
     std::fs::set_permissions(dir.join("piped-out"), std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap();
 
-    // Privilege separation: install a setuid-root copy of the binary as the
-    // delivery helper, and drop the daemon to "testuser" when the
-    // environment supports it.
-    let helper = dir.join("homemta-deliver");
-    std::fs::copy(env!("CARGO_BIN_EXE_homemta"), &helper).unwrap();
-    let mut perms = std::fs::metadata(&helper).unwrap().permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(perms.mode() | 0o4755);
-    std::fs::set_permissions(&helper, perms).unwrap();
+    // Privilege separation: the daemon forks its own root delivery helper
+    // before dropping to "testuser" (when the environment supports it).
     let user_cfg = if can_setuid() {
-        format!(
-            "\"user\": \"testuser\",\n\"deliver_helper\": \"{}\",",
-            helper.display()
-        )
+        "\"user\": \"testuser\",".to_string()
     } else {
         "\"user\": \"root\",".to_string()
     };
@@ -1322,54 +1312,117 @@ fn daemon_mode_serves_and_writes_pidfile() {
     }
 }
 
-/// The setuid binary must refuse to run anything but the delivery helper:
-/// otherwise it would execute the daemon's privileged startup code with
-/// attacker-controlled arguments (e.g. --pidfile /some/root/file).
+/// The root delivery helper only serves connections from the daemon's
+/// runtime uid (verified with SO_PEERCRED): a root peer must be refused,
+/// a daemon-uid peer must be served.
 #[test]
-fn setuid_binary_refuses_non_helper_modes() {
+fn helper_socket_checks_peer_credentials() {
     if !can_setuid() {
-        eprintln!("skipping setuid test: setuid(2) unavailable in this sandbox");
+        eprintln!("skipping helper-socket test: setuid(2) unavailable in this sandbox");
         return;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "homemta-setuid-guard-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let helper = dir.join("homemta-deliver");
-    std::fs::copy(env!("CARGO_BIN_EXE_homemta"), &helper).unwrap();
-    let mut perms = std::fs::metadata(&helper).unwrap().permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(perms.mode() | 0o4755);
-    std::fs::set_permissions(&helper, perms).unwrap();
+    let c = setup();
+    let _roots = client_roots(&c.ca);
+    let state = Arc::new(Mutex::new(SmarthostState::default()));
+    let (smarthost_port, _sm) = start_smarthost(state.clone(), &["PLAIN"], &c.ca, &c.ca_key);
+    let mta = start_mta(
+        Some(smarthost_port),
+        &["127.0.0.1"],
+        "auto",
+        "",
+        &c.ca_file,
+        &c.cert_file,
+        &c.key_file,
+        &[],
+    );
 
-    // Run the setuid binary as an unprivileged user (real uid 1000, euid 0)
-    // in daemon mode with an attacker-chosen pid file: must be refused.
-    use std::os::unix::process::CommandExt;
-    let victim = dir.join("victim");
-    let out = std::process::Command::new(&helper)
-        .arg("-c")
-        .arg("/etc/homemta.jsonc")
-        .arg("--pidfile")
-        .arg(&victim)
-        .uid(1000)
-        .output()
-        .expect("run setuid helper");
+    // The helper socket name is logged at debug level (start_mta passes -d).
+    wait_for("helper socket name in log", || {
+        std::fs::read_to_string(mta.dir.join("log"))
+            .map(|s| s.contains("delivery helper socket:"))
+            .unwrap_or(false)
+    });
+    let log = std::fs::read_to_string(mta.dir.join("log")).unwrap();
+    let name = log
+        .lines()
+        .find(|l| l.contains("delivery helper socket:"))
+        .and_then(|l| l.rsplit("delivery helper socket:").next())
+        .map(|s| s.trim().to_string())
+        .expect("helper socket name");
+    let sock_name = name;
+
+    // A root peer (uid 0, not the daemon uid 1000) must be refused.
+    let root_reply = submit_helper_request(&sock_name, 0, "testuser", b"Subject: root peer\r\n\r\nbad\r\n");
+    assert_ne!(root_reply.as_deref(), Some("OK"), "root peer must be refused");
+    std::thread::sleep(Duration::from_millis(200));
     assert!(
-        !out.status.success(),
-        "setuid invocation without --deliver-mbox must fail"
+        !mbox_content(&mta, "testuser").contains("root peer"),
+        "no mail may be delivered for a rejected peer"
     );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--deliver-mbox"),
-        "stderr must explain the refusal: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !victim.exists(),
-        "no root-side effect may happen before the refusal"
-    );
+
+    // A peer with the daemon's uid must be served.
+    let reply = submit_helper_request(&sock_name, 1000, "testuser", b"Subject: via socket\r\n\r\nhello\r\n");
+    assert_eq!(reply.as_deref(), Some("OK"), "daemon-uid peer must be served");
+    wait_for("helper socket delivery", || {
+        mbox_content(&mta, "testuser").contains("Subject: via socket")
+    });
+    // And the mailbox is owned by the user (the helper dropped to uid 1000).
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(mta.mailbox.join("testuser")).unwrap();
+    assert_eq!(md.uid(), 1000);
+}
+
+/// Send one helper request from a forked child running as `uid`; returns
+/// the helper's reply line.
+fn submit_helper_request(sock_name: &str, uid: u32, user: &str, msg: &[u8]) -> Option<String> {
+    let mut fds = [0i32; 2];
+    unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe { libc::close(fds[0]) };
+        let r = (|| -> Result<String, String> {
+            if unsafe { libc::setuid(uid) } != 0 {
+                return Err("setuid failed".into());
+            }
+            use std::io::{BufRead, Write};
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(sock_name.as_bytes())
+                .map_err(|e| e.to_string())?;
+            let s = std::os::unix::net::UnixStream::connect_addr(&addr)
+                .map_err(|e| e.to_string())?;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut w = s.try_clone().map_err(|e| e.to_string())?;
+            let mut req = format!("{}\ns@d\nr@d\n", user).into_bytes();
+            req.extend_from_slice(msg);
+            w.write_all(&req).map_err(|e| e.to_string())?;
+            let _ = w.shutdown(std::net::Shutdown::Write);
+            drop(w);
+            let mut resp = String::new();
+            let mut rd = std::io::BufReader::new(s);
+            let n = rd.read_line(&mut resp).map_err(|e| e.to_string())?;
+            Ok(if n == 0 {
+                "<closed>".into()
+            } else {
+                resp.trim().to_string()
+            })
+        })();
+        let line = r.unwrap_or_else(|e| format!("ERR {}", e));
+        unsafe {
+            libc::write(fds[1], line.as_ptr() as *const libc::c_void, line.len());
+        }
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(fds[1]) };
+    let mut buf = [0u8; 1024];
+    let n = unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    unsafe {
+        libc::close(fds[0]);
+        let mut st = 0;
+        libc::waitpid(pid, &mut st, 0);
+    }
+    if n <= 0 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
 }

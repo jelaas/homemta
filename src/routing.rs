@@ -252,7 +252,7 @@ pub fn deliver_local(
 /// and return_path_add options).
 ///
 /// The daemon normally runs unprivileged; mbox files must be owned by the
-/// mailbox user, so delivery goes through the setuid-root helper which
+/// mailbox user, so delivery goes through the forked root helper, which
 /// becomes the target user. When the daemon itself still runs as root the
 /// append is done directly and the file is chowned to the user.
 fn deliver_mbox(cfg: &Config, user: &User, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
@@ -288,7 +288,7 @@ fn deliver_mbox(cfg: &Config, user: &User, sender: &str, rcpt_full: &str, msg: &
         }
         Ok(())
     } else {
-        // Unprivileged daemon: delegate to the setuid-root helper.
+        // Unprivileged daemon: delegate to the forked root helper.
         deliver_mbox_via_helper(cfg, user, sender, rcpt_full, msg)
     }
 }
@@ -309,8 +309,8 @@ fn open_mbox(path: &Path) -> Result<std::fs::File, String> {
 }
 
 /// Helper path: append to a user's mailbox running *as* that user, so a
-/// newly created file is owned by the user. Used by the setuid helper
-/// (homemta-deliver).
+/// newly created file is owned by the user. Used by the forked root
+/// delivery helper.
 pub fn helper_append_mbox(
     cfg: &Config,
     user: &User,
@@ -380,10 +380,11 @@ pub fn append_mbox(
     Ok(())
 }
 
-/// Deliver by executing the setuid-root helper, which setuids to the
-/// mailbox owner before appending (so the file is owned by the user).
-/// The envelope (sender and recipient, each on its own line) is written to
-/// the helper's stdin followed by the raw CRLF message.
+/// Deliver by connecting to the forked root helper over its private
+/// abstract unix socket. The helper verifies our credentials (SO_PEERCRED),
+/// then becomes the mailbox owner and appends (so the file is owned by the
+/// user). The request is: user name, sender and recipient each on their
+/// own line, followed by the raw CRLF message.
 fn deliver_mbox_via_helper(
     cfg: &Config,
     user: &User,
@@ -391,46 +392,39 @@ fn deliver_mbox_via_helper(
     rcpt_full: &str,
     msg: &[u8],
 ) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(&cfg.deliver_helper)
-        .arg("--deliver-mbox")
-        .arg(&user.name)
-        .arg("-c")
-        .arg(&cfg.config_path)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "cannot run delivery helper {}: {} (is it installed setuid root?)",
-                cfg.deliver_helper, e
-            )
-        })?;
-    if let Some(mut si) = child.stdin.take() {
-        if si.write_all(sender.as_bytes()).is_err()
-            || si.write_all(b"\n").is_err()
-            || si.write_all(rcpt_full.as_bytes()).is_err()
-            || si.write_all(b"\n").is_err()
-            || si.write_all(msg).is_err()
-        {
-            let _ = child.wait();
-            return Err(format!("writing to delivery helper failed"));
-        }
+    use std::io::BufRead;
+    use std::os::unix::net::UnixStream;
+    let Some(sock_name) = &cfg.helper_socket else {
+        return Err(
+            "local delivery unavailable: no delivery helper (was homemta started as root?)"
+                .to_string(),
+        );
+    };
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(sock_name.as_bytes())
+        .map_err(|e| format!("delivery helper address: {}", e))?;
+    let stream = UnixStream::connect_addr(&addr)
+        .map_err(|e| format!("cannot connect to delivery helper: {}", e))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut req = format!("{}\n{}\n{}\n", user.name, sender, rcpt_full).into_bytes();
+    req.extend_from_slice(msg);
+    writer.write_all(&req).map_err(|e| format!("delivery helper: {}", e))?;
+    // Half-close: the helper reads the message up to EOF, then replies on
+    // the same connection.
+    let _ = writer.shutdown(std::net::Shutdown::Write);
+    drop(writer);
+    let mut resp = String::new();
+    let mut rd = std::io::BufReader::new(stream);
+    if rd.read_line(&mut resp).map_err(|e| e.to_string())? == 0 {
+        return Err("delivery helper closed the connection".to_string());
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("delivery helper: {}", e))?;
-    if out.status.success() {
+    let resp = resp.trim_end_matches(['\r', '\n']).trim().to_string();
+    if resp == "OK" {
         Ok(())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!(
-            "delivery helper failed (exit {}): {}",
-            out.status,
-            err.trim()
-        ))
+        Err(resp.strip_prefix("ERR ").unwrap_or(&resp).to_string())
     }
 }
 

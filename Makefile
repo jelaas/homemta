@@ -18,7 +18,6 @@ test:
 
 install: all
 	install -Dm755 target/$(TARGET)/release/homemta $(DESTDIR)$(PREFIX)/sbin/homemta
-	install -Dm4755 target/$(TARGET)/release/homemta $(DESTDIR)$(PREFIX)/libexec/homemta-deliver
 	install -Dm644 homemta.jsonc.example $(DESTDIR)/etc/homemta.jsonc.example
 	install -Dm644 contrib/homemta.service $(DESTDIR)/usr/lib/systemd/system/homemta.service
 

@@ -76,9 +76,10 @@
   "user": "mail",
   // Optional group (defaults to the user's primary group).
   //"group": "mail",
-  // Setuid-root helper that appends to user-owned mailboxes. Install with:
-  //   install -m4755 -o root -g root homemta /usr/local/libexec/homemta-deliver
-  "deliver_helper": "/usr/local/libexec/homemta-deliver",
+  // No helper binary is needed: before dropping privileges the daemon
+  // forks its own root delivery helper, which listens on a private
+  // abstract unix socket and only serves the daemon's own connections
+  // (verified with SO_PEERCRED).
   // Never run a delivery as these users (the classic never_users rule).
   "never_users": ["root"],
 

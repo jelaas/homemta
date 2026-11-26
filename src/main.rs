@@ -1,8 +1,9 @@
 //! homemta - a minimal MTA for home servers.
 //!
 //! Starts as root (to bind port 25), prepares its state, then drops to an
-//! unprivileged user. User-owned mailboxes are written through a
-//! setuid-root helper (`homemta-deliver`) that becomes the target user.
+//! unprivileged user. Before the drop it forks a root delivery helper that
+//! listens on a private abstract unix socket and appends to user-owned
+//! mailboxes after verifying the caller's credentials (SO_PEERCRED).
 //! Accepts mail from the internet for local domains only; no relaying.
 //! IPv4 only, static musl build.
 
@@ -113,48 +114,35 @@ fn lock_spool(dir: &str) -> std::fs::File {
 }
 
 fn load_config(path: &str) -> Config {
-    load_config_strict(path, false)
-}
-
-/// strict = true makes an insecure config file (non-root owner or
-/// group/other-writable) fatal. The setuid helper uses strict mode.
-fn load_config_strict(path: &str, strict: bool) -> Config {
-    let mut cfg = Config::default();
     match std::fs::read_to_string(path) {
         Ok(text) => {
+            let mut cfg = Config::default();
             for w in cfg.parse(&text) {
                 eprintln!("homemta: config warning: {}", w);
             }
+            // The config file must not be writable by the daemon user: the
+            // root delivery helper relies on it.
+            if !config::file_is_secure(path) {
+                eprintln!(
+                    "homemta: warning: config file {} must be owned by root and not writable by group/other",
+                    path
+                );
+            }
+            cfg.config_path = path.to_string();
+            cfg
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "homemta: no config file at {}; running with defaults (remote mail will bounce: no smarthost)",
                 path
             );
+            Config::default()
         }
         Err(e) => {
             eprintln!("homemta: cannot read {}: {}", path, e);
             std::process::exit(1);
         }
     }
-    // The config file must not be writable by the daemon user, since the
-    // setuid delivery helper trusts it.
-    if let Ok(md) = std::fs::metadata(path) {
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != 0 || md.mode() & 0o022 != 0 {
-            let msg = format!(
-                "config file {} must be owned by root and not writable by group/other",
-                path
-            );
-            if strict {
-                eprintln!("homemta: refusing to run: {}", msg);
-                std::process::exit(1);
-            }
-            eprintln!("homemta: warning: {}", msg);
-        }
-    }
-    cfg.config_path = path.to_string();
-    cfg
 }
 
 fn usage() -> ! {
@@ -182,17 +170,6 @@ OPTIONS:
     --exit-on-stdin-eof
                       shut down when stdin closes (for supervisors and tests;
                       ignored in daemon mode)
-
-INTERNAL - used by the setuid delivery helper, not meant for direct use:
-    --deliver-mbox USER
-                      append a message (envelope + body read from stdin) to
-                      USER's mailbox, running as USER. This mode is invoked
-                      by homemta itself through the setuid-root helper
-                      binary (homemta-deliver). It requires root, validates
-                      the target user and the config file, and refuses root
-                      and never_users. When invoked via the setuid bit, this
-                      is the ONLY mode the binary accepts; all other modes
-                      are refused. There is no need to call it manually.
 
 MAIL FLOW:
     Inbound SMTP on the configured ports is accepted only for local domains
@@ -312,72 +289,87 @@ fn bind_listeners(cfg: &Config) -> Vec<TcpListener> {
     listeners
 }
 
-/// Setuid delivery helper: appends to a user's mbox *as that user*, so the
-/// file is owned by the user. Must be installed setuid root. Reads the
-/// envelope (sender line, recipient line) and the raw message from stdin.
-fn helper_deliver_mbox(user: &str, config_path: &str) -> ! {
+/// Fork the root delivery helper before dropping privileges. The helper
+/// listens on a private abstract unix socket and serves only connections
+/// from the daemon's runtime uid. Returns (life-line pipe write fd,
+/// helper pid); the pipe is closed on shutdown to stop the helper.
+fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
+    use std::os::unix::net::UnixListener;
     if euid() != 0 {
-        eprintln!("homemta-deliver: must be installed setuid root (effective uid is {})", euid());
-        std::process::exit(1);
+        log::warn("not started as root: local mailbox delivery will be unavailable");
+        return None;
     }
-    let cfg = load_config_strict(config_path, true);
-    // Envelope: two lines, then the message.
-    const CAP: u64 = 128 * 1024 * 1024;
-    let mut input = Vec::new();
-    {
+    // Random, unguessable abstract socket name (defence in depth; the
+    // real boundary is the SO_PEERCRED check in the helper).
+    let mut buf = [0u8; 20];
+    let mut ok = false;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
-        let mut stdin = std::io::stdin().lock().take(CAP + 1);
-        if stdin.read_to_end(&mut input).is_err() || input.len() as u64 > CAP {
-            eprintln!("homemta-deliver: message too large");
-            std::process::exit(1);
-        }
+        ok = f.read_exact(&mut buf).is_ok();
     }
-    let nl1 = input.iter().position(|&b| b == b'\n');
-    let nl2 = nl1.and_then(|p| input[p + 1..].iter().position(|&b| b == b'\n').map(|q| p + 1 + q));
-    let (Some(nl1), Some(nl2)) = (nl1, nl2) else {
-        eprintln!("homemta-deliver: bad envelope");
-        std::process::exit(1);
+    if !ok {
+        let seed = log::unix_now().to_le_bytes();
+        buf = seed.repeat(3).as_slice()[..20].try_into().unwrap_or([7u8; 20]);
+    }
+    let name = format!("homemta-{}", homemta::base64::encode(&buf));
+    use std::os::linux::net::SocketAddrExt;
+    let addr = match std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()) {
+        Ok(a) => a,
+        Err(e) => {
+            log::error(&format!("delivery helper address: {}", e));
+            return None;
+        }
     };
-    let sender = String::from_utf8_lossy(&input[..nl1]).into_owned();
-    let rcpt_full = String::from_utf8_lossy(&input[nl1 + 1..nl2]).into_owned();
-    let msg = &input[nl2 + 1..];
+    let listener = match UnixListener::bind_addr(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error(&format!("delivery helper: cannot bind abstract socket: {}", e));
+            return None;
+        }
+    };
+    let mut pipefds = [0i32; 2];
+    if unsafe { libc::pipe(pipefds.as_mut_ptr()) } != 0 {
+        log::error("delivery helper: pipe() failed");
+        return None;
+    }
+    // The helper must only serve the daemon's own runtime uid (0 when the
+    // daemon deliberately keeps running as root).
+    let expected_uid = if cfg.user == "root" {
+        0
+    } else {
+        routing::getpwnam(cfg, &cfg.user).map(|u| u.uid).unwrap_or(u32::MAX)
+    };
+    let config_path = cfg.config_path.clone();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        log::error("delivery helper: fork failed");
+        return None;
+    }
+    if pid == 0 {
+        // Helper child: never returns.
+        unsafe { libc::close(pipefds[1]) };
+        homemta::helper::serve(listener, pipefds[0], expected_uid, config_path);
+    }
+    // Parent (daemon): close the listener and the pipe's read end, keep
+    // the socket name for connects and the write end as the life-line.
+    unsafe { libc::close(pipefds[0]) };
+    drop(listener);
+    cfg.helper_socket = Some(name.clone());
+    log::info("delivery helper started (root, private socket)");
+    // Logged for tests and debugging.
+    log::debug(&format!("delivery helper socket: {}", name));
+    Some((pipefds[1], pid))
+}
 
-    let Some(u) = routing::getpwnam(&cfg, user) else {
-        eprintln!("homemta-deliver: no such user `{}`", user);
-        std::process::exit(1);
-    };
-    if u.uid == 0 || cfg.never_users.iter().any(|n| n == &u.name) || u.name.contains('/') {
-        eprintln!("homemta-deliver: refusing to deliver as `{}` (never_users)", u.name);
-        std::process::exit(1);
-    }
-    // Keep the "mail" group so the mailbox directory (mode 2775, group
-    // mail) stays writable after setuid - the classic `group = mail`
-    // transport setting.
-    let mail_gid = routing::getgrnam(&cfg, "mail");
-    let mut groups: Vec<u32> = vec![u.gid];
-    if let Some(mg) = mail_gid {
-        if !groups.contains(&mg) {
-            groups.push(mg);
+/// Shut the delivery helper down: close the life-line pipe and reap it.
+fn stop_delivery_helper(handle: Option<(i32, i32)>) {
+    if let Some((pipe_write, pid)) = handle {
+        unsafe {
+            libc::close(pipe_write);
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
         }
     }
-    unsafe {
-        if libc::setgroups(groups.len(), groups.as_ptr() as *const libc::gid_t) != 0
-            || libc::setgid(u.gid) != 0
-            || libc::setuid(u.uid) != 0
-        {
-            eprintln!("homemta-deliver: cannot drop to uid {}", u.uid);
-            std::process::exit(1);
-        }
-    }
-    if euid() != u.uid {
-        eprintln!("homemta-deliver: privilege drop failed");
-        std::process::exit(1);
-    }
-    if let Err(e) = routing::helper_append_mbox(&cfg, &u, &sender, &rcpt_full, msg) {
-        eprintln!("homemta-deliver: {}", e);
-        std::process::exit(1);
-    }
-    std::process::exit(0);
 }
 
 fn main() {
@@ -388,7 +380,6 @@ fn main() {
     let mut daemon_mode = false;
     let mut pidfile_arg: Option<String> = None;
     let mut exit_on_stdin_eof = false;
-    let mut deliver_user: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" | "--config" => match args.next() {
@@ -403,10 +394,6 @@ fn main() {
                 None => usage(),
             },
             "--exit-on-stdin-eof" => exit_on_stdin_eof = true,
-            "--deliver-mbox" => match args.next() {
-                Some(v) => deliver_user = Some(v),
-                None => usage(),
-            },
             "-V" | "--version" => {
                 println!("homemta {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -414,23 +401,6 @@ fn main() {
             "-h" | "--help" => help(),
             _ => usage(),
         }
-    }
-
-    // A setuid invocation (real uid != 0 but effective uid 0) may ONLY run
-    // the delivery helper. Any other mode would execute privileged startup
-    // code (binding ports, chown/chmod, writing the pid file) with
-    // attacker-controlled arguments, i.e. a root file-write primitive.
-    let setuid_invocation = unsafe { libc::geteuid() == 0 && libc::getuid() != 0 };
-    if setuid_invocation && deliver_user.is_none() {
-        eprintln!(
-            "homemta: invoked via the setuid bit without --deliver-mbox; \
-             the setuid binary only supports delivery-helper mode"
-        );
-        std::process::exit(1);
-    }
-
-    if let Some(user) = deliver_user {
-        helper_deliver_mbox(&user, &config_path);
     }
 
     // Detach first so the invoking shell gets its prompt back immediately;
@@ -444,7 +414,6 @@ fn main() {
     if let Some(p) = pidfile_arg {
         cfg.pid_file = Some(p);
     }
-    let cfg = Arc::new(cfg);
     log::init(cfg.log_file.as_deref(), debug);
 
     if daemon_mode {
@@ -467,8 +436,10 @@ fn main() {
 
     if queue_only {
         let _spool_lock = lock_spool(&cfg.spool_dir);
+        let helper = start_delivery_helper(&mut cfg);
         drop_privileges(&cfg);
-        queue::run_once(&cfg);
+        queue::run_once(&Arc::new(cfg));
+        stop_delivery_helper(helper);
         return;
     }
 
@@ -520,10 +491,13 @@ fn main() {
         );
     }
 
-    // Bind before dropping privileges: port 25 requires root.
+    // Bind before dropping privileges: port 25 requires root. The delivery
+    // helper is forked here as well, so it stays root after the drop.
     let listeners = bind_listeners(&cfg);
     write_pidfile(&cfg);
+    let helper = start_delivery_helper(&mut cfg);
     drop_privileges(&cfg);
+    let cfg = Arc::new(cfg);
 
     let (wake_tx, wake_rx) = mpsc::channel();
 
@@ -565,5 +539,6 @@ fn main() {
     }
     let _ = runner.join();
     remove_pidfile(&cfg);
+    stop_delivery_helper(helper);
     log::info("homemta exiting");
 }

@@ -17,6 +17,12 @@ A minimal MTA for home servers, written in Rust.
   mechanism the smarthost offers.
 - **IPv4 only**, **TLS support** (STARTTLS for incoming connections, TLS
   for the smarthost), classic retry schedule and bounce messages.
+- **Privilege separation without setuid**: the daemon starts as root to
+  bind port 25, forks its own root delivery helper (which listens on a
+  private abstract unix socket and only serves the daemon's own
+  connections, verified via SO_PEERCRED), then drops to an unprivileged
+  user. User-owned mailboxes are written by the helper after it becomes
+  the mailbox owner.
 - **Static musl binary.** Two runtime dependencies: `rustls` (TLS, with
   the pure-Rust `ring` backend) and `libc` (musl bindings). The JSONC
   config parser, DNS, base64, MD5, SHA-256, HMAC, PBKDF2, SCRAM and the

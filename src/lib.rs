@@ -8,6 +8,7 @@ pub mod base64;
 pub mod bounce;
 pub mod config;
 pub mod dns;
+pub mod helper;
 pub mod jsonc;
 pub mod log;
 pub mod md5;
