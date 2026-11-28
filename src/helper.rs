@@ -25,12 +25,33 @@ use crate::routing;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 const MAX_MSG: u64 = 128 * 1024 * 1024;
 const MAX_LINE: u64 = 1024;
 /// Cap on concurrent delivery children (refuse extra requests).
 const MAX_CHILDREN: i32 = 32;
+
+/// Write end of the SIGCHLD wakeup pipe: the signal handler writes one
+/// byte per signal so the poll loop wakes up and reaps finished delivery
+/// children immediately instead of leaving them as zombies until the next
+/// connection (or the life-line) happens to wake the loop.
+static SIGCHLD_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_sigchld(_: libc::c_int) {
+    // Async-signal-safe: one raw write, no allocation, no locking. The
+    // write end is nonblocking; if the pipe ever filled, dropping a byte
+    // only skips one wakeup - the reap loop below collects every exited
+    // child in a single pass, so no accounting is lost.
+    let fd = SIGCHLD_WAKE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
 
 fn peer_uid(listener_fd: i32) -> Option<u32> {
     unsafe {
@@ -205,6 +226,19 @@ pub fn serve(
     let listener_fd = listener.as_raw_fd();
     let secret_bytes = secret.into_bytes();
     let mut active_children: i32 = 0;
+    // SIGCHLD wakeup pipe: without it the loop only reaps delivery
+    // children when a new connection or the life-line wakes poll(), so
+    // the last child of a quiet period would stay a zombie indefinitely
+    // (visible as `[homemta] <defunct>` in ps(1)).
+    let mut wake_fds = [0i32; 2];
+    if unsafe { libc::pipe2(wake_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        crate::log::error("delivery helper: cannot create SIGCHLD wake pipe");
+        std::process::exit(1);
+    }
+    SIGCHLD_WAKE_FD.store(wake_fds[1], Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGCHLD, on_sigchld as *const () as libc::sighandler_t);
+    }
     loop {
         let mut fds = [
             libc::pollfd {
@@ -217,9 +251,33 @@ pub fn serve(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: wake_fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) } < 0 {
+            // A SIGCHLD delivered between the reap below and poll() (or a
+            // handler installed without SA_RESTART) interrupts poll: the
+            // wakeup byte is already in the pipe, so simply retry.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             std::process::exit(1);
+        }
+        // Drain the SIGCHLD wakeups. The exact count does not matter: the
+        // reap below collects every exited child in one pass.
+        if fds[2].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 64];
+            while unsafe {
+                libc::read(
+                    wake_fds[0],
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            } > 0
+            {}
         }
         // Reap finished delivery children.
         loop {
@@ -271,11 +329,15 @@ pub fn serve(
                 active_children += 1;
             }
             if pid == 0 {
-                // Child: close the listener and the life-line, verify the
-                // secret, serve the request, exit. Single-threaded, so
+                // Child: close the listener, the life-line and the
+                // SIGCHLD wake pipe (it must neither hold the pipe ends
+                // open nor wake the helper for its own children), verify
+                // the secret, serve the request, exit. Single-threaded, so
                 // fork here is safe.
                 drop(listener);
                 let _ = libc::close(life_pipe);
+                let _ = libc::close(wake_fds[0]);
+                let _ = libc::close(wake_fds[1]);
                 process_request(stream, &secret_bytes, &config_path);
                 std::process::exit(0);
             }

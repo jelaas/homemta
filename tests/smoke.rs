@@ -1506,15 +1506,84 @@ fn helper_does_not_hold_daemon_fds() {
     let helper_pid: i32 = children.split_whitespace().next().unwrap().parse().unwrap();
     let mta_fds = std::fs::read_dir(format!("/proc/{}/fd", mta_pid)).unwrap().count();
     let helper_fds = std::fs::read_dir(format!("/proc/{}/fd", helper_pid)).unwrap().count();
+    // The helper holds its own stdio, unix listener, life-line pipe, log
+    // file and the two fds of the SIGCHLD wake pipe - but never the
+    // daemon's SMTP listeners or spool lock (+2 allows for the wake pipe).
     assert!(
-        helper_fds < mta_fds,
-        "helper must hold fewer fds than the daemon (helper {}, daemon {})",
+        helper_fds <= mta_fds + 2,
+        "helper must not hold the daemon's fds (helper {}, daemon {})",
         helper_fds,
         mta_fds
     );
     assert!(
-        helper_fds <= 6,
-        "helper should only hold stdio, unix listener, life-line pipe and log file (got {})",
+        helper_fds <= 8,
+        "helper should only hold stdio, unix listener, life-line pipe, log file and the SIGCHLD wake pipe (got {})",
         helper_fds
     );
+}
+
+/// Every local delivery runs in a forked helper child; once the child
+/// exits the helper must reap it right away (SIGCHLD wakeup). Otherwise
+/// the last child of a quiet period lingers as a zombie - visible as
+/// `[homemta] <defunct>` in ps(1) - until the next connection happens to
+/// wake the helper.
+#[test]
+fn helper_reaps_delivery_children() {
+    if !can_setuid() {
+        eprintln!("skipping child-reaping test: root delivery helper unavailable");
+        return;
+    }
+    let c = setup();
+    let roots = client_roots(&c.ca);
+    let mta = start_mta(
+        None,
+        &["127.0.0.1"],
+        "auto",
+        "",
+        &c.ca_file,
+        &c.cert_file,
+        &c.key_file,
+        &[],
+    );
+
+    // The delivery helper is the daemon's only child process.
+    let mta_pid = mta.child.id() as i32;
+    let daemon_children = format!("/proc/{}/task/{}/children", mta_pid, mta_pid);
+    wait_for("helper child visible", || {
+        std::fs::read_to_string(&daemon_children)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    });
+    let helper_pid: i32 = std::fs::read_to_string(&daemon_children)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let helper_children = format!("/proc/{}/task/{}/children", helper_pid, helper_pid);
+
+    // A local delivery forks exactly one helper child.
+    let (code, reply) = smtp_submit(
+        mta.port,
+        false,
+        &roots,
+        "testuser@test.example",
+        &["testuser@test.example"],
+        &["Subject: reap me", "", "body"],
+    );
+    assert_eq!(code, 250, "submission failed: {:?}", reply);
+    wait_for("local delivery", || {
+        mbox_content(&mta, "testuser").contains("Subject: reap me")
+    });
+
+    // With no further connections or queue activity, the exited delivery
+    // child must still be reaped: the helper's child list goes empty.
+    // (Before the SIGCHLD wakeup fix this wait timed out: the zombie
+    // stayed until the next helper connection.)
+    wait_for("delivery child reaped", || {
+        std::fs::read_to_string(&helper_children)
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false)
+    });
 }
