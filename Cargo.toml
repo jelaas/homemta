@@ -1,6 +1,6 @@
 [package]
 name = "homemta"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A minimal MTA for home servers: local submission on localhost, mbox delivery, smarthost sending"
 license = "MIT"
