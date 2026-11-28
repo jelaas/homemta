@@ -72,6 +72,7 @@ and trailing commas) and adjust:
 | `tls.cert` / `tls.key`       | enable STARTTLS on the listen ports                              |
 | `mailbox_dir`                | where mbox files live (default `/var/spool/mail`)                |
 | `aliases_file`               | default `/etc/aliases`                                           |
+| `pipe_user` / `pipe_group`  | run `/etc/aliases` pipes as this user/group (default: daemon user) |
 | `spool_dir`                  | outgoing queue (default `/var/spool/homemta`)                    |
 
 Run it (as root, or with `CAP_NET_BIND_SERVICE`):
@@ -154,7 +155,16 @@ rustls with the bundle you provide only - the system trust store is never
 consulted, so old distro packages don't matter.
 - Pipe and file targets are honoured only in the root-owned
   `/etc/aliases`; they run as the daemon user, with a 10-minute timeout
-  for pipes. In a user's `~/.forward` they are ignored (logged), because
+  for pipes. Set `pipe_user` (and optionally `pipe_group`) to run pipes
+  as another user instead, e.g. the owner of a mailing-list spool such as
+  mlmmj's. The root delivery helper then switches to that user, and only
+  for a command that appears verbatim as a `|pipe` item in a root-owned,
+  not group/world-writable aliases file; `never_users` still applies.
+  File targets always run as the daemon user. Pipe input starts with
+  `Delivered-To:`, `Return-path:`, `Envelope-to:` and `Delivery-date:`
+  headers (mlmmj and similar list managers read `Delivered-To:` to find
+  the list address and its `+suffix`). Pipe input gets LF line endings
+  but no `>From ` escaping, since it is one message rather than mbox data. In a user's `~/.forward` they are ignored (logged), because
   the daemon user can read the spool and every mailbox. A `.forward` may
   only redirect to addresses (or `:blackhole:`), must be a regular file
   owned by the user (or root), must not be group/world-writable, and is

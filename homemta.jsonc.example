@@ -83,6 +83,13 @@
   // Never run a delivery as these users (the classic never_users rule).
   "never_users": ["root"],
 
+  // Run "|command" pipes from /etc/aliases as this user instead of the
+  // daemon user (e.g. the owner of a mailing-list spool). The aliases
+  // file must then be root-owned and not group/world-writable. Optional
+  // pipe_group defaults to the pipe user's primary group.
+  //"pipe_user": "exim",
+  //"pipe_group": "mem",
+
   // Queue behaviour: scan every N seconds (the queue is also processed
   // immediately after every accepted message).
   "queue_interval": 30,

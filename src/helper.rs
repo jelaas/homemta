@@ -14,6 +14,11 @@
 //! the config file must be root-owned and not group/world-writable, the
 //! user must exist in the passwd file, and uid 0 / never_users are
 //! refused. Privileges are dropped *before* any file is touched.
+//!
+//! A target of the form `|command` runs an /etc/aliases pipe as the
+//! configured `pipe_user`. The helper never runs a command just because
+//! the daemon sent it: the aliases file must be root-owned and not
+//! group/world-writable, and must list exactly that `|command`.
 
 use crate::config::{file_is_secure, Config};
 use crate::routing;
@@ -120,6 +125,14 @@ fn process_request(stream: std::os::unix::net::UnixStream, secret: &[u8], config
         }
     };
 
+    if let Some(cmd) = user_name.strip_prefix('|') {
+        send_reply(&writer, &match run_alias_pipe(&cfg, cmd, &sender, &rcpt_full, &msg) {
+            Ok(()) => "OK".to_string(),
+            Err(e) => format!("ERR {}", e),
+        });
+        return;
+    }
+
     let Some(u) = routing::getpwnam(&cfg, &user_name) else {
         send_reply(&writer, &format!("ERR no such user `{}`", user_name));
         return;
@@ -158,6 +171,25 @@ fn process_request(stream: std::os::unix::net::UnixStream, secret: &[u8], config
         Ok(()) => send_reply(&writer, "OK"),
         Err(e) => send_reply(&writer, &format!("ERR {}", e)),
     }
+}
+
+/// Run a pipe listed in the system aliases file as `pipe_user`.
+fn run_alias_pipe(cfg: &Config, cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
+    if cfg.pipe_user.is_none() {
+        return Err("pipe_user is not configured".to_string());
+    }
+    if !file_is_secure(&cfg.aliases_file) {
+        return Err(format!(
+            "{} is not root-owned or is group/world-writable; refusing to run pipe_user pipes",
+            cfg.aliases_file
+        ));
+    }
+    if !routing::alias_file_has_pipe(cfg, cmd) {
+        crate::log::warn(&format!("delivery helper: refused pipe not listed in {}", cfg.aliases_file));
+        return Err(format!("pipe `{}` is not listed in {}", cmd, cfg.aliases_file));
+    }
+    let run_as = routing::pipe_identity(cfg)?.ok_or("pipe_user is not configured")?;
+    routing::deliver_pipe(cmd, sender, rcpt_full, msg, Some(&run_as))
 }
 
 /// The helper process's main loop; never returns (exits via the life-line

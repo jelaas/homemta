@@ -947,6 +947,83 @@ fn alias_pipe_delivery() {
     });
 }
 
+/// pipe_user: alias pipes run as the configured user/group (through the
+/// root helper when the daemon is unprivileged), and only while the
+/// aliases file is root-owned and not group/world-writable.
+#[test]
+fn alias_pipe_runs_as_pipe_user() {
+    let c = setup();
+    let roots = client_roots(&c.ca);
+    let state = Arc::new(Mutex::new(SmarthostState::default()));
+    let (smarthost_port, _sm) = start_smarthost(state.clone(), &["LOGIN"], &c.ca, &c.ca_key);
+    let mta = start_mta(
+        Some(smarthost_port),
+        &["127.0.0.1"],
+        "auto",
+        "\"pipe_user\": \"listowner\", \"pipe_group\": \"lists\",",
+        &c.ca_file,
+        &c.cert_file,
+        &c.key_file,
+        &[],
+    );
+    std::fs::write(
+        mta.dir.join("passwd"),
+        "root:x:0:0:root:/root:/bin/sh\n\
+         testuser:x:1000:1000:Test:/home/testuser:/bin/sh\n\
+         listowner:x:1001:1001:Lists:/var/lists:/bin/false\n",
+    )
+    .unwrap();
+    std::fs::write(mta.dir.join("group"), "mail:x:12:\nlists:x:2000:\n").unwrap();
+    let out = mta.dir.join("pipe-user-out");
+    std::fs::write(&out, "").unwrap();
+    std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o666)).unwrap();
+    let aliases = mta.dir.join("aliases");
+    std::fs::write(
+        &aliases,
+        format!(
+            "postmaster: testuser\nlist: \"|{{ id -u; id -g; echo $HOME; cat; }} >> {}\"\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&aliases, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+
+    let (code, reply) = smtp_submit(
+        mta.port,
+        false,
+        &roots,
+        "testuser@test.example",
+        &["list@test.example"],
+        &["Subject: to list", "", "list body"],
+    );
+    assert_eq!(code, 250, "submission failed: {:?}", reply);
+    wait_for("pipe_user delivery", || {
+        std::fs::read_to_string(&out).map(|s| s.contains("list body")).unwrap_or(false)
+    });
+    let got = std::fs::read_to_string(&out).unwrap();
+    assert!(got.starts_with("1001\n2000\n/var/lists\n"), "pipe ran with the wrong identity: {}", got);
+    assert!(got.contains("\nDelivered-To: list@test.example\nReturn-path: <testuser@test.example>\n"), "{}", got);
+
+    // Through the helper, a group-writable aliases file must not be
+    // trusted to pick commands run as pipe_user: the delivery bounces.
+    if can_setuid() {
+        std::fs::set_permissions(&aliases, std::os::unix::fs::PermissionsExt::from_mode(0o664)).unwrap();
+        let (code, _) = smtp_submit(
+            mta.port,
+            false,
+            &roots,
+            "testuser@test.example",
+            &["list@test.example"],
+            &["Subject: insecure", "", "must not run"],
+        );
+        assert_eq!(code, 250);
+        wait_for("insecure aliases bounce", || {
+            mbox_content(&mta, "testuser").contains("group/world-writable")
+        });
+        assert!(!std::fs::read_to_string(&out).unwrap().contains("must not run"));
+    }
+}
+
 #[test]
 fn remote_rejected_when_no_smarthost() {
     let c = setup();

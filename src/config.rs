@@ -67,6 +67,11 @@ pub struct Config {
     pub group: Option<String>,
     /// Never run a delivery as these users (the classic never_users rule).
     pub never_users: Vec<String>,
+    /// Run pipe deliveries from /etc/aliases as this user instead of the
+    /// daemon user (the classic pipe transport `user` option).
+    pub pipe_user: Option<String>,
+    /// Group for pipe deliveries (defaults to pipe_user's primary group).
+    pub pipe_group: Option<String>,
     /// Path of the loaded config file (set at startup, not from the file).
     pub config_path: String,
     /// Optional pid file written after startup and removed on shutdown
@@ -121,6 +126,8 @@ impl Default for Config {
             user: "mail".to_string(),
             group: None,
             never_users: vec!["root".to_string()],
+            pipe_user: None,
+            pipe_group: None,
             config_path: String::new(),
             pid_file: None,
             helper_socket: None,
@@ -253,6 +260,14 @@ impl Config {
                     _ => want_str(key, v).map(|s| self.pid_file = Some(s)),
                 },
                 "never_users" => want_str_list(key, v).map(|l| self.never_users = l),
+                "pipe_user" => match v {
+                    Json::Null => Ok(self.pipe_user = None),
+                    _ => want_str(key, v).map(|s| self.pipe_user = Some(s)),
+                },
+                "pipe_group" => match v {
+                    Json::Null => Ok(self.pipe_group = None),
+                    _ => want_str(key, v).map(|s| self.pipe_group = Some(s)),
+                },
                 "max_sessions" => want_u64(key, v).and_then(|n| {
                     if n > 0 && n <= 65536 {
                         self.max_sessions = n as usize;

@@ -59,6 +59,62 @@ pub fn getpwnam(cfg: &Config, name: &str) -> Option<User> {
     None
 }
 
+/// Identity a pipe delivery switches to (the `pipe_user` option).
+#[derive(Clone, Debug)]
+pub struct RunAs {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub home: String,
+}
+
+/// Resolve `pipe_user` / `pipe_group`. `Ok(None)` when no pipe user is
+/// configured (pipes then run as the daemon user). Root and never_users
+/// are refused, like every other delivery identity.
+pub fn pipe_identity(cfg: &Config) -> Result<Option<RunAs>, String> {
+    let Some(name) = &cfg.pipe_user else {
+        return Ok(None);
+    };
+    let u = getpwnam(cfg, name).ok_or_else(|| format!("pipe_user `{}` does not exist", name))?;
+    if u.uid == 0 || cfg.never_users.iter().any(|n| n == &u.name) {
+        return Err(format!(
+            "refusing to run a pipe as `{}` (never_users)",
+            u.name
+        ));
+    }
+    let gid = match &cfg.pipe_group {
+        Some(g) => getgrnam(cfg, g).ok_or_else(|| format!("pipe_group `{}` does not exist", g))?,
+        None => u.gid,
+    };
+    let mut groups = vec![gid];
+    if !groups.contains(&u.gid) {
+        groups.push(u.gid);
+    }
+    Ok(Some(RunAs {
+        name: u.name,
+        uid: u.uid,
+        gid,
+        groups,
+        home: u.home,
+    }))
+}
+
+/// True when `cmd` is exactly the command of a `|pipe` item in the system
+/// aliases file. The root helper only runs pipes the administrator listed
+/// there, never an arbitrary command sent over its socket.
+pub fn alias_file_has_pipe(cfg: &Config, cmd: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(&cfg.aliases_file) else {
+        return false;
+    };
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once(':'))
+        .flat_map(|(_, value)| parse_items(value))
+        .any(|item| item.trim().strip_prefix('|') == Some(cmd))
+}
+
 /// Look up a group id by name.
 pub fn getgrnam(cfg: &Config, name: &str) -> Option<u32> {
     let text = std::fs::read_to_string(&cfg.group_file).ok()?;
@@ -299,10 +355,27 @@ pub fn deliver_local(
             Target::RemoteAddr(a) => remote.push(a),
             Target::File { path } => deliver_file(sender, rcpt_full, &path, msg)?,
             Target::Pipe { cmd } => {
-                // Pipes from aliases/.forward run as the daemon user,
-                // matching the classic default (no explicit user
-                // configured for pipe deliveries).
-                deliver_pipe(&cmd, sender, rcpt_full, msg)?;
+                // Pipes (only /etc/aliases may contain them) run as the
+                // daemon user unless pipe_user is configured. An
+                // unprivileged daemon asks the root helper to switch user.
+                if cfg.pipe_user.is_none() {
+                    deliver_pipe(&cmd, sender, rcpt_full, msg, None)?;
+                } else if unsafe { libc::geteuid() } == 0 {
+                    let run_as = pipe_identity(cfg)?;
+                    deliver_pipe(&cmd, sender, rcpt_full, msg, run_as.as_ref())?;
+                } else {
+                    if cmd.contains(['\r', '\n']) {
+                        return Err(format!("pipe `{}`: command contains a line break", cmd));
+                    }
+                    helper_request(
+                        cfg,
+                        &format!("|{}", cmd),
+                        sender,
+                        rcpt_full,
+                        msg,
+                        PIPE_TIMEOUT + std::time::Duration::from_secs(30),
+                    )?;
+                }
             }
             Target::Blackhole => {}
         }
@@ -393,6 +466,33 @@ pub fn helper_append_mbox(
     append_mbox(&mut f, sender, rcpt_full, msg)
 }
 
+/// Cut an envelope string at the first control character so it can never
+/// break out of a header line or the From_ line.
+fn header_safe(s: &str) -> String {
+    s.chars()
+        .take_while(|c| *c >= ' ' && *c != '\u{7f}')
+        .collect()
+}
+
+/// Headers prepended to pipe input: Delivered-To: (the Postfix/qmail
+/// convention, which mailing-list managers such as mlmmj use to find the
+/// list address and its +suffix) followed by the classic Return-path:,
+/// Envelope-to: and Delivery-date:.
+fn pipe_headers(sender: &str, rcpt_full: &str) -> String {
+    let sender = header_safe(sender);
+    let rcpt = header_safe(rcpt_full);
+    format!(
+        "Delivered-To: {}\n\
+         Return-path: <{}>\n\
+         Envelope-to: <{}>\n\
+         Delivery-date: {}\n",
+        rcpt,
+        sender,
+        rcpt,
+        crate::log::rfc2822_now()
+    )
+}
+
 /// Write the mbox-format data to an already-open mailbox, taking an
 /// exclusive lock while appending.
 pub fn append_mbox(
@@ -417,13 +517,8 @@ pub fn append_mbox(
     // The envelope strings come from two paths (validated SMTP input, or
     // the helper socket request from the daemon). Defence in depth: strip
     // anything that could break out of a header or the From_ line.
-    let clean = |s: &str| {
-        s.chars()
-            .take_while(|c| *c >= ' ' && *c != '\u{7f}')
-            .collect::<String>()
-    };
-    let sender = clean(sender);
-    let rcpt_full = clean(rcpt_full);
+    let sender = header_safe(sender);
+    let rcpt_full = header_safe(rcpt_full);
     let from_sender = if sender.is_empty() { "MAILER-DAEMON".to_string() } else { sender.clone() };
     let head = format!(
         "From {} {}\n\
@@ -454,17 +549,29 @@ pub fn append_mbox(
     Ok(())
 }
 
-/// Deliver by connecting to the forked root helper over its private
-/// abstract unix socket. The helper verifies our credentials (SO_PEERCRED),
-/// then becomes the mailbox owner and appends (so the file is owned by the
-/// user). The request is: user name, sender and recipient each on their
-/// own line, followed by the raw CRLF message.
 fn deliver_mbox_via_helper(
     cfg: &Config,
     user: &User,
     sender: &str,
     rcpt_full: &str,
     msg: &[u8],
+) -> Result<(), String> {
+    helper_request(cfg, &user.name, sender, rcpt_full, msg, std::time::Duration::from_secs(30))
+}
+
+/// Send one delivery to the forked root helper over its private abstract
+/// unix socket. The helper verifies our credentials (SO_PEERCRED). The
+/// request is: target, sender and recipient each on their own line,
+/// followed by the raw CRLF message. The target is a user name (append to
+/// that user's mbox as the user) or `|command` (run an /etc/aliases pipe
+/// as pipe_user).
+fn helper_request(
+    cfg: &Config,
+    target: &str,
+    sender: &str,
+    rcpt_full: &str,
+    msg: &[u8],
+    reply_timeout: std::time::Duration,
 ) -> Result<(), String> {
     use std::io::BufRead;
     use std::os::unix::net::UnixStream;
@@ -485,12 +592,12 @@ fn deliver_mbox_via_helper(
     };
     let stream = UnixStream::connect_addr(&addr)
         .map_err(|e| format!("cannot connect to delivery helper: {}", e))?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(reply_timeout));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     let mut req = format!(
         "{}\n{}\n{}\n{}\n",
-        secret, user.name, sender, rcpt_full
+        secret, target, sender, rcpt_full
     )
     .into_bytes();
     req.extend_from_slice(msg);
@@ -554,6 +661,19 @@ fn deliver_file(
 }
 
 /// Convert CRLF to LF with ">From " escaping.
+/// CRLF -> LF only, no `>From ` escaping: pipe input is a single message,
+/// not mbox framing, so "From " lines are passed through unchanged (as the
+/// classic pipe transport does). A pipe that appends to an mbox itself is
+/// responsible for its own escaping.
+fn lf_only(msg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(msg.len() + 16);
+    for line in msg.split(|&b| b == b'\n') {
+        out.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+        out.push(b'\n');
+    }
+    out
+}
+
 fn lf_escape(msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(msg.len() + 16);
     for line in msg.split(|&b| b == b'\n') {
@@ -567,9 +687,6 @@ fn lf_escape(msg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Pipe the message through a shell command (alias/forward pipe target).
-/// Runs as the daemon user, like classic pipe deliveries without an
-/// explicit user setting.
 /// Wall-clock limit for a pipe command (the classic pipe transport default
 /// is one hour; a home server does not need more than this).
 const PIPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -586,10 +703,21 @@ fn drain_capped(mut r: impl Read, cap: u64) -> (Vec<u8>, u64) {
     (kept, total)
 }
 
-fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
+/// Pipe the message through a shell command (alias pipe target). Runs as
+/// the calling process's user, or as `run_as` (requires root: the child
+/// switches user before exec), like the classic pipe transport `user`
+/// option.
+pub fn deliver_pipe(
+    cmd: &str,
+    sender: &str,
+    rcpt_full: &str,
+    msg: &[u8],
+    run_as: Option<&RunAs>,
+) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
-    let mut child = std::process::Command::new("/bin/sh")
+    let mut command = std::process::Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg(cmd)
         .env_clear()
@@ -601,14 +729,40 @@ fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<
         .stderr(std::process::Stdio::piped())
         // Own process group, so a timeout kills the whole pipeline (and
         // no background grandchild keeps our pipes open).
-        .process_group(0)
+        .process_group(0);
+    if let Some(id) = run_as {
+        let (uid, gid, groups) = (id.uid, id.gid, id.groups.clone());
+        command
+            .env("HOME", &id.home)
+            .env("USER", &id.name)
+            .env("LOGNAME", &id.name)
+            .current_dir("/");
+        // Runs in the forked child before exec: only async-signal-safe
+        // syscalls, no allocation. Supplementary groups are replaced too.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(groups.len(), groups.as_ptr() as *const libc::gid_t) != 0
+                    || libc::setgid(gid) != 0
+                    || libc::setuid(uid) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::geteuid() != uid || libc::getegid() != gid {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot spawn pipe `{}`: {}", cmd, e))?;
 
     // Feed stdin and drain stdout/stderr on their own threads: writing the
     // whole message first would deadlock against a command that fills its
     // output pipe before reading its input.
-    let input = lf_escape(msg);
+    let mut input = pipe_headers(sender, rcpt_full).into_bytes();
+    input.extend_from_slice(&lf_only(msg));
     let (wtx, wrx) = mpsc::channel();
     let stdin = child.stdin.take();
     std::thread::spawn(move || {
@@ -851,7 +1005,7 @@ mod tests {
         let mut msg = b"Subject: big\r\n\r\n".to_vec();
         msg.extend_from_slice(&big);
         msg.extend_from_slice(b"\r\n");
-        let r = deliver_pipe("head -c 2000000 /dev/zero", "s@d", "r@d", &msg);
+        let r = deliver_pipe("head -c 2000000 /dev/zero", "s@d", "r@d", &msg, None);
         // Exit status is 0; the unread stdin may yield a write error, but
         // the call must return instead of deadlocking.
         let _ = r;
@@ -966,9 +1120,74 @@ mod tests {
         let _cfg = Arc::new(c);
         let out_file = tmp.join("piped");
         let cmd = format!("cat > {}", out_file.display());
-        deliver_pipe(&cmd, "s@d", "r@d", b"Subject: p\r\n\r\npiped body\r\n").unwrap();
+        deliver_pipe(&cmd, "s@d", "r@d", b"Subject: p\r\n\r\npiped body\r\nFrom here on\r\n", None).unwrap();
         let content = std::fs::read_to_string(&out_file).unwrap();
+        assert!(content.starts_with("Delivered-To: r@d\nReturn-path: <s@d>\nEnvelope-to: <r@d>\nDelivery-date: "));
         assert!(content.contains("Subject: p\n"));
         assert!(content.contains("piped body\n"));
+        // No mbox ">From " escaping for pipes; CRLF is still normalized.
+        assert!(content.contains("\nFrom here on\n"), "{}", content);
+        assert!(!content.contains(">From") && !content.contains('\r'));
+        // Envelope strings can never inject extra header lines.
+        let out2 = tmp.join("piped2");
+        let cmd = format!("cat > {}", out2.display());
+        deliver_pipe(&cmd, "", "r@d\r\nX-Evil: 1", b"Subject: q\r\n\r\nb\r\n", None).unwrap();
+        let content = std::fs::read_to_string(&out2).unwrap();
+        assert!(content.starts_with("Delivered-To: r@d\nReturn-path: <>\n"));
+        assert!(!content.contains("X-Evil"));
+    }
+
+    #[test]
+    fn alias_file_pipe_listing() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-pipelist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let c = test_cfg(&tmp);
+        std::fs::write(
+            &c.aliases_file,
+            "# list\nfamiljen:  \"|/opt/mlmmj/bin/mlmmj-receive -L /var/spool/mlmmj/familjen/\"\n\
+             other: jelaas, |/usr/bin/logger\n\
+             #commented: |/bin/evil\n",
+        )
+        .unwrap();
+        assert!(alias_file_has_pipe(&c, "/opt/mlmmj/bin/mlmmj-receive -L /var/spool/mlmmj/familjen/"));
+        assert!(alias_file_has_pipe(&c, "/usr/bin/logger"));
+        assert!(!alias_file_has_pipe(&c, "/bin/evil"));
+        assert!(!alias_file_has_pipe(&c, "/usr/bin/logger; rm -rf /"));
+        assert!(!alias_file_has_pipe(&c, "jelaas"));
+    }
+
+    #[test]
+    fn pipe_identity_resolution() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-pipeid-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut c = test_cfg(&tmp);
+        std::fs::write(
+            &c.passwd_file,
+            "root:x:0:0:root:/root:/bin/sh\nexim:x:101:102:Exim:/var/spool/exim:/bin/false\n",
+        )
+        .unwrap();
+        std::fs::write(&c.group_file, "mail:x:12:\nmem:x:500:\n").unwrap();
+        assert!(pipe_identity(&c).unwrap().is_none());
+
+        c.pipe_user = Some("exim".to_string());
+        let id = pipe_identity(&c).unwrap().unwrap();
+        assert_eq!((id.uid, id.gid, id.groups.clone()), (101, 102, vec![102]));
+        assert_eq!(id.home, "/var/spool/exim");
+
+        c.pipe_group = Some("mem".to_string());
+        let id = pipe_identity(&c).unwrap().unwrap();
+        assert_eq!((id.uid, id.gid, id.groups), (101, 500, vec![500, 102]));
+
+        c.pipe_group = Some("nosuchgroup".to_string());
+        assert!(pipe_identity(&c).is_err());
+        c.pipe_group = None;
+
+        c.pipe_user = Some("root".to_string());
+        assert!(pipe_identity(&c).unwrap_err().contains("never_users"));
+        c.pipe_user = Some("nobody-here".to_string());
+        assert!(pipe_identity(&c).is_err());
+        c.pipe_user = Some("exim".to_string());
+        c.never_users.push("exim".to_string());
+        assert!(pipe_identity(&c).is_err());
     }
 }
