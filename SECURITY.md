@@ -2,8 +2,42 @@
 
 This document records the security reviews of homemta: what was examined,
 what was found and fixed, and the residual risks that remain by design.
-Last reviewed: 2026-11-26 (post IPC redesign; see git history for the
-earlier setuid-binary review).
+Last reviewed: 2026-11-28 (memory-safety / untrusted-data audit, see
+below); previously 2026-11-26 (post IPC redesign; see git history for
+the earlier setuid-binary review).
+
+## 2026-11-28 audit: C-class bugs and untrusted data
+
+Scope: every `unsafe` block and FFI call, all hand-written parsers
+(SMTP server/client, address, base64, PEM, JSONC, spool, SCRAM) and
+every path where peer-, user- or file-controlled data flows. Note that
+the release profile uses `panic = "abort"`: in this codebase a panic is
+the Rust equivalent of a C crash and kills the whole daemon.
+
+**No memory-safety defects found.** FFI use is correct
+(`getaddrinfo`/`freeaddrinfo` freed exactly once and never on error,
+`SO_PEERCRED`, `gethostname` truncation, `localtime_r` indexing);
+base64/MD5/SHA-256/HMAC/PBKDF2/PEM index arithmetic is in bounds.
+
+**Fixed:**
+
+| severity | issue | fix |
+| --- | --- | --- |
+| high | SMTP smuggling: bare LF ended DATA lines, so `\n.\n` ended the message and the remainder ran as commands (spoofed mail; relay if a localhost hop forwards) | DATA accepts only CRLF; a bare LF/CR gets `554` and the connection is closed |
+| high | A rejected message (NUL byte, size limit) stopped reading DATA mid-message, so the remaining body lines were parsed as SMTP commands | the rest of the data is drained to `CRLF.CRLF` before replying |
+| high | `~/.forward` pipe/file targets ran as the daemon user (gid `mail`: read/write every mailbox, the spool) | ignored in `.forward` (still allowed in root-owned `/etc/aliases`); `.forward` must be a regular file owned by the user or root, not group/world-writable, opened `O_NOFOLLOW`, size-capped |
+| high | unlimited RCPTs: one message could be delivered millions of times (disk fill), and the `Received:` header was unbounded | 100 recipients per transaction (`452`), duplicates delivered once |
+| medium | DATA stored one `Vec` per line (12-17x memory over `max_message_size`) and cloned it again | one contiguous buffer, header/body split by borrowing |
+| medium | smarthost reply parser sliced `line[4..]`: a 3-byte reply or a multi-byte char at offset 4 panicked (abort); reply size unbounded | checked parsing, 4 KiB per line, 128 lines |
+| medium | pipe deliveries wrote all of stdin before reading output and had no timeout: deadlock or a permanently blocked session/queue thread | stdin/stdout/stderr on separate threads, output capped, 10-minute timeout, own process group killed on timeout |
+| medium | domain literals `user@[...]` accepted any bytes (bare CR, NUL, DEL, 8-bit) into headers, spool and smarthost commands | only `[IPv4]` literals |
+| low | malformed uid/gid in passwd parsed as 0 (root) | entry treated as unknown |
+| low | helper child counter leaked on `fork()` failure (eventually refusing all deliveries) | counted only after a successful fork |
+| low | SCRAM: unbounded server iteration count (CPU DoS), `i=0` accepted, `235` without server-final accepted (no server authentication) | 1..=1,000,000 iterations; server signature required; saslname escaping |
+| low | helper secret/socket name and SCRAM nonce fell back to zeros or the clock when `/dev/urandom` failed | `getrandom(2)` with `/dev/urandom` fallback; fail closed |
+| low | slow-drip connections: no total session limit, global-only session cap, non-atomic check | 30-minute session limit, per-IP cap (quarter of `max_sessions`, min 4; relay hosts exempt), atomic reservation released on drop; thread spawn failure no longer panics |
+| nit | `rlim_cur as i32` truncation in the helper's fd cleanup; `read_line` accepted `MAX_LINE + 1` bytes; size/duration multiplications wrapped; spool header `split_at(1)` could panic on odd content; STARTTLS setup failure left the session without I/O (panic) | `/proc/self/fd` walk; exact cap; checked arithmetic (durations <= 100 years); char-based parsing; session ended |
+| integrity | 8-bit message content was replaced by U+FFFD (lossy UTF-8 in DATA and the spool) despite 8BITMIME; JSONC decoded strings byte-by-byte (non-ASCII passwords broke) | raw bytes end to end; proper UTF-8 in JSONC |
 
 ## Threat model
 
@@ -127,6 +161,14 @@ Everything the helper receives is treated as untrusted:
   the helper, warning in the daemon).
 
 ## Residual risks (by design)
+
+- **Alias pipes/files run as the daemon user**: pipe and file targets in
+  `/etc/aliases` (root-controlled) run with the daemon's uid and gid
+  `mail`, so they can read the spool and all mailboxes. Only add
+  commands there that you trust with that access.
+- **Per-message fan-out**: 100 recipients x `max_message_size` can still
+  be written for one message (bounded, as in any MTA); size the mailbox
+  filesystem or use quotas accordingly.
 
 - **Local-delivery DoS**: a malicious process sharing the daemon's uid
   can occupy helper slots (32 x 30 s) and slow local delivery. It cannot

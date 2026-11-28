@@ -152,8 +152,17 @@ the daemon user. It is re-read on every smarthost connection, so updating
 the file takes effect immediately without restarting. Verification uses
 rustls with the bundle you provide only - the system trust store is never
 consulted, so old distro packages don't matter.
-- Pipe and file targets in aliases/`.forward` run under `pipe_user`
-  (default `nobody`); `:blackhole:` is supported.
+- Pipe and file targets are honoured only in the root-owned
+  `/etc/aliases`; they run as the daemon user, with a 10-minute timeout
+  for pipes. In a user's `~/.forward` they are ignored (logged), because
+  the daemon user can read the spool and every mailbox. A `.forward` may
+  only redirect to addresses (or `:blackhole:`), must be a regular file
+  owned by the user (or root), must not be group/world-writable, and is
+  never read through a symlink.
+- Message data must use CRLF line endings: a bare LF or CR inside DATA
+  is rejected with `554` and the connection is closed (SMTP smuggling
+  defence). At most 100 recipients per message; duplicates are
+  delivered once.
 - No outbound delivery directly to destination MXes: everything goes
   through the smarthost.
 

@@ -267,9 +267,28 @@ impl Parser<'_> {
                     }
                 }
                 b'\n' => return Err(self.err("newline in string")),
-                _ => {
+                _ if c < 0x80 => {
                     out.push(c as char);
                     self.pos += 1;
+                }
+                _ => {
+                    // Multi-byte UTF-8 character: copy it whole (pushing
+                    // each byte as a char would turn "é" into "Ã©", e.g.
+                    // breaking non-ASCII passwords). The input came from a
+                    // &str, so it is valid UTF-8; still checked, not assumed.
+                    let len = match c {
+                        0xc0..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf7 => 4,
+                        _ => return Err(self.err("invalid UTF-8 in string")),
+                    };
+                    let ch = self
+                        .s
+                        .get(self.pos..self.pos + len)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .ok_or_else(|| self.err("invalid UTF-8 in string"))?;
+                    out.push_str(ch);
+                    self.pos += len;
                 }
             }
         }
@@ -309,6 +328,12 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ascii_strings_kept() {
+        let j = parse("{\"p\": \"p\u{e5}ss\u{2603}\u{1f600}\"}").unwrap();
+        assert_eq!(j.get("p").unwrap().as_str(), Some("p\u{e5}ss\u{2603}\u{1f600}"));
+    }
 
     #[test]
     fn basic_types() {

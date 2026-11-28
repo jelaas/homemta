@@ -76,29 +76,55 @@ impl Conn {
     }
 
     fn read_reply(&mut self) -> std::io::Result<Reply> {
-        let mut line = String::new();
-        let mut text = String::new();
-        loop {
-            line.clear();
-            self.rd.read_line(&mut line)?;
-            if line.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ));
-            }
-            let code: u16 = line.get(..3).and_then(|c| c.parse().ok()).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad reply line")
-            })?;
-            let rest = line[4..].trim_end_matches(['\r', '\n']).to_string();
-            text.push_str(&rest);
-            let multiline = line.as_bytes().get(3) == Some(&b'-');
-            if !multiline {
-                return Ok(Reply { code, text });
-            }
-            text.push('\n');
-        }
+        read_reply_from(&mut self.rd)
     }
+}
+
+/// Longest reply line accepted (RFC 5321 allows 512; be generous).
+const MAX_REPLY_LINE: u64 = 4096;
+/// Most continuation lines in one multiline reply.
+const MAX_REPLY_LINES: usize = 128;
+
+/// Parse one (possibly multiline) SMTP reply. Every byte comes from the
+/// peer: lengths are capped and nothing is sliced at unchecked offsets (a
+/// panic aborts the whole daemon).
+fn read_reply_from(rd: &mut impl BufRead) -> std::io::Result<Reply> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut line = String::new();
+    let mut text = String::new();
+    for _ in 0..MAX_REPLY_LINES {
+        line.clear();
+        let n = (&mut *rd).take(MAX_REPLY_LINE + 1).read_line(&mut line)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ));
+        }
+        if n as u64 > MAX_REPLY_LINE {
+            return Err(bad("reply line too long"));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        let b = line.as_bytes();
+        if b.len() < 3 || !b[..3].iter().all(|c| c.is_ascii_digit()) {
+            return Err(bad("bad reply line"));
+        }
+        let code: u16 = line[..3].parse().map_err(|_| bad("bad reply line"))?;
+        // Byte 3 is ' ', '-' or absent; anything else is malformed. The
+        // text starts at byte 4 only when byte 3 is one of those ASCII
+        // separators, so the slice is always on a char boundary.
+        let multiline = match b.get(3) {
+            None | Some(b' ') => false,
+            Some(b'-') => true,
+            Some(_) => return Err(bad("bad reply line")),
+        };
+        text.push_str(line.get(4..).unwrap_or(""));
+        if !multiline {
+            return Ok(Reply { code, text });
+        }
+        text.push('\n');
+    }
+    Err(bad("too many reply lines"))
 }
 
 struct Caps {
@@ -310,7 +336,7 @@ fn auth_scram(conn: &mut Conn, user: &str, pass: &str) -> Result<(), Fail> {
     if r.code != 334 {
         return Err(Fail::Perm(format!("AUTH SCRAM-SHA-256 rejected: {}", r.text)));
     }
-    let client_nonce = crate::scram::nonce();
+    let client_nonce = crate::scram::nonce().map_err(Fail::Temp)?;
     let client_first = crate::scram::client_first(user, &client_nonce);
     let client_first_bare = client_first.strip_prefix("n,,").unwrap_or(&client_first);
     conn.send(&base64::encode(client_first.as_bytes()))
@@ -360,7 +386,13 @@ fn auth_scram(conn: &mut Conn, user: &str, pass: &str) -> Result<(), Fail> {
         if r.code != 235 {
             return Err(Fail::Perm(format!("SCRAM-SHA-256 authentication failed: {}", r.text)));
         }
-    } else if r.code != 235 {
+    } else if r.code == 235 {
+        // Success without server-final: the server never proved it knows
+        // the password (RFC 5802 mutual authentication), so do not trust it.
+        return Err(Fail::Perm(
+            "SCRAM-SHA-256: server reported success without a server signature".to_string(),
+        ));
+    } else {
         return Err(Fail::Perm(format!("SCRAM-SHA-256 authentication failed: {}", r.text)));
     }
     Ok(())
@@ -607,6 +639,29 @@ mod tests {
         assert!(c.size);
         assert!(c.starttls);
         assert_eq!(c.auth, vec!["CRAM-MD5".to_string(), "PLAIN".to_string()]);
+    }
+
+    fn reply(input: &[u8]) -> std::io::Result<Reply> {
+        read_reply_from(&mut std::io::BufReader::new(input))
+    }
+
+    #[test]
+    fn reply_parsing_is_panic_free() {
+        let r = reply(b"250-first\r\n250 second\r\n").unwrap();
+        assert_eq!((r.code, r.text.as_str()), (250, "first\nsecond"));
+        assert_eq!(reply(b"354\r\n").unwrap().code, 354);
+        // These used to panic (slice past the end / inside a UTF-8 char),
+        // which aborts the daemon.
+        assert_eq!(reply(b"250").unwrap().code, 250);
+        assert!(reply("250é".as_bytes()).is_err());
+        assert!(reply("2é0 x\r\n".as_bytes()).is_err());
+        assert!(reply(b"").is_err());
+        assert!(reply(b"abc def\r\n").is_err());
+        // Unbounded input is refused.
+        let long = format!("250 {}\r\n", "x".repeat(10_000));
+        assert!(reply(long.as_bytes()).is_err());
+        let many = "250-x\r\n".repeat(1000);
+        assert!(reply(many.as_bytes()).is_err());
     }
 
     #[test]

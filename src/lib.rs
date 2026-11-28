@@ -14,6 +14,7 @@ pub mod log;
 pub mod md5;
 pub mod pem;
 pub mod queue;
+pub mod random;
 pub mod routing;
 pub mod scram;
 pub mod sha256;

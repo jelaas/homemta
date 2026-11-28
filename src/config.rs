@@ -192,12 +192,21 @@ fn want_size(key: &str, v: &Json) -> Result<u64, String> {
 
 /// Accepts a duration as seconds or a string with s/m/h/d/w suffix.
 fn want_duration(key: &str, v: &Json) -> Result<u64, String> {
-    match v {
-        Json::Num(_) => want_u64(key, v),
-        Json::Str(s) => parse_duration(s).map_err(|e| format!("`{}`: {}", key, e)),
-        _ => Err(format!("`{}` must be a duration (\"4d\") or seconds", key)),
+    let d = match v {
+        Json::Num(_) => want_u64(key, v)?,
+        Json::Str(s) => parse_duration(s).map_err(|e| format!("`{}`: {}", key, e))?,
+        _ => return Err(format!("`{}` must be a duration (\"4d\") or seconds", key)),
+    };
+    // Durations are added to i64 timestamps in the queue: keep them far
+    // away from overflow.
+    if d > MAX_DURATION {
+        return Err(format!("`{}`: duration too large (max {}s)", key, MAX_DURATION));
     }
+    Ok(d)
 }
+
+/// 100 years.
+const MAX_DURATION: u64 = 100 * 365 * 86400;
 
 fn want_bool(key: &str, v: &Json) -> Result<bool, String> {
     v.as_bool()
@@ -420,8 +429,9 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     };
     num.trim()
         .parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("invalid size: {}", s))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid size: {}", s))
 }
 
 /// Parse a duration in seconds, or with s/m/h/d/w suffixes.
@@ -437,8 +447,9 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
     };
     num.trim()
         .parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("invalid duration: {}", s))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid duration: {}", s))
 }
 
 /// Hostname for defaults, via musl gethostname.
@@ -495,6 +506,9 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), 30);
         assert_eq!(parse_duration("2h").unwrap(), 7200);
         assert_eq!(parse_duration("4d").unwrap(), 345600);
+        // Overflow is an error, not a silent wrap-around.
+        assert!(parse_size("17179869184G").is_err());
+        assert!(parse_duration("30500568904944w").is_err());
     }
 
     #[test]

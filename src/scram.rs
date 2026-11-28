@@ -24,24 +24,27 @@ fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
     hmac_sha256(key, msg)
 }
 
-/// Generate a random base64 nonce (uses /dev/urandom).
-pub fn nonce() -> String {
+/// Generate a random base64 nonce. Fails instead of returning a
+/// predictable value when no kernel randomness is available.
+pub fn nonce() -> Result<String, String> {
     let mut buf = [0u8; 18];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if f.read_exact(&mut buf).is_err() {
-            buf = crate::log::unix_now().to_le_bytes().repeat(2).as_slice()[..18]
-                .try_into()
-                .unwrap_or([7u8; 18]);
-        }
-    }
-    base64::encode(&buf)
+    crate::random::fill(&mut buf)?;
+    Ok(base64::encode(&buf))
 }
+
+/// Accepted PBKDF2 iteration counts from the server. RFC 7677 recommends
+/// at least 4096; the upper bound stops a hostile or spoofed server from
+/// pinning the queue runner in PBKDF2 for hours (u32::MAX iterations).
+pub const MIN_ITERATIONS: u32 = 1;
+pub const MAX_ITERATIONS: u32 = 1_000_000;
 
 /// Client-first message: "n,,n=<user>,r=<nonce>".
 pub fn client_first(username: &str, nonce: &str) -> String {
-    // SASLprep is out of scope; usernames are used verbatim.
-    format!("n,,n={},r={}", username, nonce)
+    // SASLprep is out of scope; usernames are used verbatim apart from the
+    // RFC 5802 saslname escaping of ',' and '=' (which would otherwise
+    // break the attribute syntax).
+    let user = username.replace('=', "=3D").replace(',', "=2C");
+    format!("n,,n={},r={}", user, nonce)
 }
 
 #[derive(Debug)]
@@ -64,10 +67,16 @@ pub fn parse_server_first(msg: &str) -> Result<ServerFirst, String> {
             "r" => nonce = Some(v.to_string()),
             "s" => salt = Some(base64::decode(v).ok_or("bad SCRAM salt base64")?),
             "i" => {
-                iter = Some(
-                    v.parse::<u32>()
-                        .map_err(|_| format!("bad SCRAM iteration count: {}", v))?,
-                )
+                let n = v
+                    .parse::<u32>()
+                    .map_err(|_| format!("bad SCRAM iteration count: {}", v))?;
+                if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&n) {
+                    return Err(format!(
+                        "SCRAM iteration count {} outside {}..={}",
+                        n, MIN_ITERATIONS, MAX_ITERATIONS
+                    ));
+                }
+                iter = Some(n)
             }
             "m" | "e" => return Err(format!("SCRAM extension not supported: {}", k)),
             _ => {}
@@ -233,9 +242,21 @@ mod tests {
 
     #[test]
     fn nonce_is_base64() {
-        let n = nonce();
+        let n = nonce().unwrap();
         assert!(!n.is_empty());
         assert!(base64::decode(&n).is_some());
+    }
+
+    #[test]
+    fn iteration_count_bounded() {
+        assert!(parse_server_first("r=A,s=QSXCR+Q6sek8bf92,i=0").is_err());
+        assert!(parse_server_first("r=A,s=QSXCR+Q6sek8bf92,i=4294967295").is_err());
+        assert!(parse_server_first("r=A,s=QSXCR+Q6sek8bf92,i=4096").is_ok());
+    }
+
+    #[test]
+    fn username_is_escaped() {
+        assert_eq!(client_first("a,b=c", "N"), "n,,n=a=2Cb=3Dc,r=N");
     }
 
     #[test]

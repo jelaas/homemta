@@ -69,11 +69,11 @@ pub fn enqueue(cfg: &Arc<Config>, sender: &str, rcpts: &[String], msg: &[u8]) ->
 
 fn read_spool(path: &Path) -> Option<SpoolMsg> {
     let data = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&data);
-    let (head, body) = match text.split_once("\n\n") {
-        Some((h, b)) => (h, b),
-        None => return None,
-    };
+    // Only the metadata header is text; the message stays raw bytes (a
+    // lossy UTF-8 conversion would corrupt 8-bit mail).
+    let split = data.windows(2).position(|w| w == b"\n\n")?;
+    let head = String::from_utf8_lossy(&data[..split]);
+    let body = &data[split + 2..];
     let mut m = SpoolMsg {
         sender: String::new(),
         rcpts: Vec::new(),
@@ -84,21 +84,25 @@ fn read_spool(path: &Path) -> Option<SpoolMsg> {
         msg: Vec::new(),
     };
     for line in head.lines() {
-        let (k, v) = line.split_at(1);
+        // First *char*, not byte: split_at(1) panics on an empty line or a
+        // multi-byte first character (and a panic aborts the daemon).
+        let mut cs = line.chars();
+        let Some(k) = cs.next() else { continue };
+        let v = cs.as_str();
         match k {
-            "S" => m.sender = v.to_string(),
-            "R" => m.rcpts.push(v.to_string()),
-            "F" => m.first_fail = v.parse().unwrap_or(0),
-            "L" => m.last_try = v.parse().unwrap_or(0),
-            "N" => m.tries = v.parse().unwrap_or(0),
-            "Z" => m.frozen = v.parse().unwrap_or(0),
+            'S' => m.sender = v.to_string(),
+            'R' => m.rcpts.push(v.to_string()),
+            'F' => m.first_fail = v.parse().unwrap_or(0),
+            'L' => m.last_try = v.parse().unwrap_or(0),
+            'N' => m.tries = v.parse().unwrap_or(0),
+            'Z' => m.frozen = v.parse().unwrap_or(0),
             _ => {}
         }
     }
     if m.rcpts.is_empty() {
         return None;
     }
-    m.msg = body.as_bytes().to_vec();
+    m.msg = body.to_vec();
     Some(m)
 }
 
@@ -373,5 +377,23 @@ mod tests {
         assert_eq!(m.sender, "a@b.c");
         assert_eq!(m.rcpts, vec!["x@y.z".to_string(), "q@r.s".to_string()]);
         assert_eq!(m.msg, b"Subject: t\r\n\r\nbody\r\n");
+    }
+
+    #[test]
+    fn spool_keeps_8bit_and_survives_odd_headers() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-spool8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join("m");
+        // Non-UTF-8 body bytes, an empty header line and a multi-byte
+        // first character must neither panic nor corrupt the message.
+        let mut data = Vec::new();
+        data.extend_from_slice("Sa@b\n\r\n\u{e9}junk\nRx@y\nF0\nL0\nN0\nZ0\n\n".as_bytes());
+        data.extend_from_slice(b"Subject: \xff\xfe\r\n\r\nbody \xe9\r\n");
+        std::fs::write(&p, &data).unwrap();
+        let m = read_spool(&p).unwrap();
+        assert_eq!(m.sender, "a@b");
+        assert_eq!(m.rcpts, vec!["x@y".to_string()]);
+        assert_eq!(m.msg, b"Subject: \xff\xfe\r\n\r\nbody \xe9\r\n");
     }
 }

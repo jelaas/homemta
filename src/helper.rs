@@ -223,11 +223,21 @@ pub fn serve(
             drop(stream);
             continue;
         }
-        active_children += 1;
         let config_path = config_path.clone();
         let secret_bytes = secret_bytes.clone();
         unsafe {
             let pid = libc::fork();
+            if pid < 0 {
+                // No child was created: do not count it, or transient
+                // fork failures (EAGAIN) would leak slots until the helper
+                // refuses every delivery.
+                crate::log::warn("delivery helper: fork failed, refusing request");
+                drop(stream);
+                continue;
+            }
+            if pid > 0 {
+                active_children += 1;
+            }
             if pid == 0 {
                 // Child: close the listener and the life-line, verify the
                 // secret, serve the request, exit. Single-threaded, so

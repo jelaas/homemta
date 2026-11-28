@@ -42,10 +42,16 @@ pub fn getpwnam(cfg: &Config, name: &str) -> Option<User> {
     for line in text.lines() {
         let f: Vec<&str> = line.splitn(7, ':').collect();
         if f.len() >= 6 && f[0] == name {
+            // A malformed uid/gid must never turn into 0 (root): fail
+            // closed and treat the user as unknown.
+            let (Ok(uid), Ok(gid)) = (f[2].parse::<u32>(), f[3].parse::<u32>()) else {
+                log::warn(&format!("malformed passwd entry for `{}` in {}", name, cfg.passwd_file));
+                return None;
+            };
             return Some(User {
                 name: f[0].to_string(),
-                uid: f[2].parse().unwrap_or(0),
-                gid: f[3].parse().unwrap_or(0),
+                uid,
+                gid,
                 home: f[5].to_string(),
             });
         }
@@ -108,8 +114,26 @@ fn expand_inner(cfg: &Config, addr: &Addr, chain: &mut Vec<String>) -> Result<Ve
     let user_name = strip_suffix(&addr.local);
     if let Some(user) = getpwnam(cfg, user_name) {
         let fwd = Path::new(&user.home).join(".forward");
-        if let Ok(text) = std::fs::read_to_string(&fwd) {
-            let items = parse_items(&text);
+        if let Some(text) = read_forward(&fwd, &user) {
+            // ~/.forward is controlled by an ordinary local user, but
+            // deliveries run as the daemon user (which can read the spool
+            // and, via group mail, every mailbox). So a .forward may only
+            // redirect to addresses: pipe and file targets are ignored.
+            // (Pipes/files in the root-owned /etc/aliases still work.)
+            let items: Vec<String> = parse_items(&text)
+                .into_iter()
+                .filter(|it| {
+                    let t = it.trim();
+                    let cmd = t.starts_with('|') || t.starts_with('/');
+                    if cmd {
+                        log::warn(&format!(
+                            "{}: ignoring pipe/file target (not permitted in .forward)",
+                            fwd.display()
+                        ));
+                    }
+                    !cmd
+                })
+                .collect();
             if !items.is_empty() {
                 let mut out = Vec::new();
                 for item in items {
@@ -134,6 +158,46 @@ fn expand_inner(cfg: &Config, addr: &Addr, chain: &mut Vec<String>) -> Result<Ve
         }
     }
     Err(format!("unknown user {}", addr.local))
+}
+
+/// Cap on a ~/.forward file (it is a short list of addresses).
+const MAX_FORWARD: u64 = 64 * 1024;
+
+/// Read a user's ~/.forward the classic safe way: never through a symlink,
+/// only a regular file owned by the user (or root) and not writable by
+/// group/other, size-capped. Anything else is ignored with a warning.
+fn read_forward(path: &Path, user: &User) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                log::warn(&format!("{}: is a symlink, ignored", path.display()));
+            }
+            return None;
+        }
+    };
+    let md = f.metadata().ok()?;
+    if !md.is_file() || (md.uid() != user.uid && md.uid() != 0) || md.mode() & 0o022 != 0 {
+        log::warn(&format!(
+            "{}: not a regular file owned by {} (or root) and not group/world-writable, ignored",
+            path.display(),
+            user.name
+        ));
+        return None;
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_FORWARD + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_FORWARD {
+        log::warn(&format!("{}: larger than {} bytes, ignored", path.display(), MAX_FORWARD));
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// Expand one alias/forward item (address, |pipe, /file, :blackhole:).
@@ -506,7 +570,24 @@ fn lf_escape(msg: &[u8]) -> Vec<u8> {
 /// Pipe the message through a shell command (alias/forward pipe target).
 /// Runs as the daemon user, like classic pipe deliveries without an
 /// explicit user setting.
+/// Wall-clock limit for a pipe command (the classic pipe transport default
+/// is one hour; a home server does not need more than this).
+const PIPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How much of a pipe command's stdout/stderr is kept (the rest is drained).
+const PIPE_OUTPUT_CAP: u64 = 64 * 1024;
+
+/// Read a stream to EOF, keeping at most `cap` bytes and discarding the
+/// rest so the writer never blocks on a full pipe.
+fn drain_capped(mut r: impl Read, cap: u64) -> (Vec<u8>, u64) {
+    let mut kept = Vec::new();
+    let _ = (&mut r).take(cap).read_to_end(&mut kept);
+    let extra = std::io::copy(&mut r, &mut std::io::sink()).unwrap_or(0);
+    (kept, kept.len() as u64 + extra)
+}
+
 fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
     let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
@@ -517,30 +598,84 @@ fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group, so a timeout kills the whole pipeline (and
+        // no background grandchild keeps our pipes open).
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot spawn pipe `{}`: {}", cmd, e))?;
-    if let Some(mut si) = child.stdin.take() {
-        if let Err(e) = si.write_all(&lf_escape(msg)) {
-            return Err(format!("pipe `{}` write error: {}", cmd, e));
-        }
+
+    // Feed stdin and drain stdout/stderr on their own threads: writing the
+    // whole message first would deadlock against a command that fills its
+    // output pipe before reading its input.
+    let input = lf_escape(msg);
+    let (wtx, wrx) = mpsc::channel();
+    let stdin = child.stdin.take();
+    std::thread::spawn(move || {
+        let r = match stdin {
+            Some(mut si) => si.write_all(&input),
+            None => Ok(()),
+        };
+        let _ = wtx.send(r);
+    });
+    let (otx, orx) = mpsc::channel();
+    if let Some(so) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let _ = otx.send(drain_capped(so, PIPE_OUTPUT_CAP));
+        });
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("pipe `{}` wait error: {}", cmd, e))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let (etx, erx) = mpsc::channel();
+    if let Some(se) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let _ = etx.send(drain_capped(se, PIPE_OUTPUT_CAP));
+        });
+    }
+
+    let deadline = std::time::Instant::now() + PIPE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {}
+            Err(e) => return Err(format!("pipe `{}` wait error: {}", cmd, e)),
+        }
+        if std::time::Instant::now() >= deadline {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "pipe `{}` timed out after {}s and was killed",
+                cmd,
+                PIPE_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    // The command has exited; its helpers finish as soon as the pipes are
+    // closed. Never wait forever on them (a detached grandchild could still
+    // hold a pipe end).
+    let grace = std::time::Duration::from_secs(5);
+    let write_res = wrx.recv_timeout(grace).unwrap_or(Ok(()));
+    let (_, out_len) = orx.recv_timeout(grace).unwrap_or((Vec::new(), 0));
+    let (err_buf, _) = erx.recv_timeout(grace).unwrap_or((Vec::new(), 0));
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err_buf);
         return Err(format!(
             "pipe `{}` exited {}: {}",
             cmd,
-            out.status,
+            status,
             err.trim()
         ));
     }
-    if !out.stdout.is_empty() {
+    if let Err(e) = write_res {
+        return Err(format!("pipe `{}` write error: {}", cmd, e));
+    }
+    if out_len > 0 {
         log::info(&format!(
             "pipe `{}` output ignored ({} bytes)",
             cmd,
-            out.stdout.len()
+            out_len
         ));
     }
     Ok(())
@@ -634,15 +769,20 @@ mod tests {
         let home = tmp.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let c = test_cfg(&tmp);
+        // The .forward must be owned by the user: use our own uid.
+        let uid = unsafe { libc::getuid() };
         std::fs::write(
             c.passwd_file.clone(),
             format!(
-                "root:x:0:0:root:/root:/bin/sh\njelaas:x:1000:1000:J:{}:/bin/sh\n",
+                "root:x:0:0:root:/root:/bin/sh\njelaas:x:{}:{}:J:{}:/bin/sh\n",
+                uid,
+                uid,
                 home.display()
             ),
         )
         .unwrap();
         std::fs::write(home.join(".forward"), "jelaas@jelaas.eu\n").unwrap();
+        std::fs::set_permissions(home.join(".forward"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut chain = Vec::new();
         let e = expand(
             &c,
@@ -651,6 +791,69 @@ mod tests {
         );
         assert!(e.is_err());
         assert!(e.unwrap_err().contains("loop"));
+    }
+
+    /// Writes passwd with our own uid and a .forward with `content`/`mode`,
+    /// then expands jelaas@jelaas.eu.
+    fn expand_with_forward(tag: &str, content: &str, mode: u32) -> Vec<Target> {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let c = test_cfg(&tmp);
+        let uid = unsafe { libc::getuid() };
+        std::fs::write(
+            c.passwd_file.clone(),
+            format!("jelaas:x:{}:{}:J:{}:/bin/sh\n", uid, uid, home.display()),
+        )
+        .unwrap();
+        std::fs::write(home.join(".forward"), content).unwrap();
+        std::fs::set_permissions(home.join(".forward"), std::fs::Permissions::from_mode(mode)).unwrap();
+        let mut chain = Vec::new();
+        expand(&c, &crate::address::parse("<jelaas@jelaas.eu>").unwrap(), &mut chain).unwrap()
+    }
+
+    #[test]
+    fn forward_pipes_and_files_ignored() {
+        // Pipe/file targets in a user's .forward would run as the daemon
+        // user: they are dropped; with nothing else left, mail goes to the
+        // mbox.
+        let t = expand_with_forward("fwd-cmd", "|cat /etc/shadow, \"/tmp/x\"\n", 0o644);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(t[0], Target::Mbox { .. }));
+        // Addresses next to a pipe still work; the pipe is not run.
+        let t = expand_with_forward("fwd-mixed", "|true, other@example.org\n", 0o644);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(&t[0], Target::RemoteAddr(a) if a == "other@example.org"));
+    }
+
+    #[test]
+    fn forward_writable_by_others_ignored() {
+        let t = expand_with_forward("fwd-perm", "other@example.org\n", 0o666);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(t[0], Target::Mbox { .. }));
+    }
+
+    #[test]
+    fn malformed_passwd_uid_is_not_root() {
+        let tmp = std::env::temp_dir().join(format!("homemta-test-pwbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let c = test_cfg(&tmp);
+        std::fs::write(c.passwd_file.clone(), "jelaas:x:abc:1000:J:/home/j:/bin/sh\n").unwrap();
+        assert!(getpwnam(&c, "jelaas").is_none());
+    }
+
+    #[test]
+    fn pipe_that_ignores_stdin_with_big_output_does_not_hang() {
+        // Writes > pipe buffer to stdout without reading stdin, then exits.
+        let big = vec![b'x'; 1024 * 1024];
+        let mut msg = b"Subject: big\r\n\r\n".to_vec();
+        msg.extend_from_slice(&big);
+        msg.extend_from_slice(b"\r\n");
+        let r = deliver_pipe("head -c 2000000 /dev/zero", "s@d", "r@d", &msg);
+        // Exit status is 0; the unread stdin may yield a write error, but
+        // the call must return instead of deadlocking.
+        let _ = r;
     }
 
     #[test]

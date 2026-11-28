@@ -316,25 +316,14 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
     // Random, unguessable abstract socket name (defence in depth; the
     // real boundary is the SO_PEERCRED check plus the shared secret).
     let mut buf = [0u8; 20];
-    let mut ok = false;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        ok = f.read_exact(&mut buf).is_ok();
-    }
-    if !ok {
-        let seed = log::unix_now().to_le_bytes();
-        buf = seed.repeat(3).as_slice()[..20].try_into().unwrap_or([7u8; 20]);
-    }
     // A second factor shared with the helper: the helper accepts a request
     // only when the first line matches this secret (constant-time). Passed
-    // by fork inheritance; never in argv/env/logs.
+    // by fork inheritance; never in argv/env/logs. Fails closed: without
+    // kernel randomness there is no helper (no predictable fallback).
     let mut secret_buf = [0u8; 32];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut secret_buf);
-    } else {
-        let seed = log::unix_now().to_le_bytes();
-        secret_buf = seed.repeat(4).as_slice()[..32].try_into().unwrap_or([7u8; 32]);
+    if let Err(e) = homemta::random::fill(&mut buf).and_then(|_| homemta::random::fill(&mut secret_buf)) {
+        log::error(&format!("delivery helper not started: {}", e));
+        return None;
     }
     let secret = homemta::md5::hex(&secret_buf);
     let name = format!("homemta-{}", homemta::base64::encode(&buf));
@@ -380,19 +369,9 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
         // 25) or the spool lock.
         unsafe {
             libc::close(pipefds[1]);
-            let keep = [listener_fd, pipefds[0], log::file_fd().unwrap_or(-1)];
-            let mut limit: libc::rlimit = std::mem::zeroed();
-            let limit = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                limit.rlim_cur as i32
-            } else {
-                65536
-            };
-            for fd in 3..limit.max(3) {
-                if !keep.contains(&fd) {
-                    libc::close(fd);
-                }
-            }
         }
+        let keep = [listener_fd, pipefds[0], log::file_fd().unwrap_or(-1)];
+        close_inherited_fds(&keep);
         homemta::helper::serve(listener, pipefds[0], expected_uid, secret, config_path);
     }
     // Parent (daemon): close the listener and the pipe's read end, keep
@@ -405,6 +384,39 @@ fn start_delivery_helper(cfg: &mut Config) -> Option<(i32, i32)> {
     // Logged for tests and debugging.
     log::debug(&format!("delivery helper socket: {}", name));
     Some((pipefds[1], pid))
+}
+
+/// Close every fd >= 3 except `keep`. Uses /proc/self/fd so the work is
+/// proportional to the open fds, not to RLIMIT_NOFILE (which may be huge,
+/// or RLIM_INFINITY, which must not be truncated into a negative bound).
+fn close_inherited_fds(keep: &[i32]) {
+    if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+        // Collect first: the directory iterator holds an fd of its own.
+        let fds: Vec<i32> = dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+            .collect();
+        for fd in fds {
+            if fd > 2 && !keep.contains(&fd) {
+                unsafe { libc::close(fd) };
+            }
+        }
+        return;
+    }
+    // No /proc: fall back to the soft limit, clamped to a sane range.
+    let limit = unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            lim.rlim_cur.min(1 << 20) as i32
+        } else {
+            65536
+        }
+    };
+    for fd in 3..limit.max(3) {
+        if !keep.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
+    }
 }
 
 /// Shut the delivery helper down: close the life-line pipe and reap it.

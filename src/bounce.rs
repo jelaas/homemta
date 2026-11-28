@@ -26,14 +26,16 @@ fn sanitize_text(s: &str) -> String {
 
 fn random_boundary() -> String {
     let mut buf = [0u8; 12];
-    let seed = crate::log::unix_now().to_le_bytes();
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if f.read_exact(&mut buf).is_err() {
-            buf = seed.repeat(2).as_slice()[..12].try_into().unwrap_or([7u8; 12]);
-        }
-    } else {
-        buf = seed.repeat(2).as_slice()[..12].try_into().unwrap_or([7u8; 12]);
+    if let Err(e) = crate::random::fill(&mut buf) {
+        // Bounces must still go out: fall back to a unique (though not
+        // unpredictable) value and say so.
+        log::warn(&format!("bounce boundary: {}", e));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        buf[..8].copy_from_slice(&nanos.to_le_bytes());
+        buf[8..].copy_from_slice(&std::process::id().to_le_bytes());
     }
     format!(
         "homemta-{:x}-{:x}",

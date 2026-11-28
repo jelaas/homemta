@@ -45,10 +45,15 @@ pub fn parse(s: &str) -> Result<Addr, String> {
             return Err(format!("invalid character in local part: {:?}", c));
         }
     }
-    // Domain literal user@[192.0.2.1] is kept verbatim; other domains are
-    // restricted to letters/digits/-/.
-    let domain = if domain.starts_with('[') && domain.ends_with(']') {
-        domain.to_string()
+    // Domain literals must be an IPv4 address (user@[192.0.2.1]); anything
+    // else between brackets (controls, bare CR, spaces, 8-bit bytes) would
+    // otherwise reach headers, the spool and the smarthost verbatim. Other
+    // domains are restricted to letters/digits/-/.
+    let domain = if let Some(lit) = domain.strip_prefix('[') {
+        match lit.strip_suffix(']') {
+            Some(ip) if ip.parse::<std::net::Ipv4Addr>().is_ok() => domain.to_string(),
+            _ => return Err("invalid domain literal".to_string()),
+        }
     } else {
         if !domain
             .chars()
@@ -125,6 +130,12 @@ mod tests {
     fn domain_literal() {
         let a = parse("<user@[192.0.2.1]>").unwrap();
         assert_eq!(a.domain, "[192.0.2.1]");
+        // Only IPv4 literals; no control characters or junk inside.
+        assert!(parse("<user@[192.0.2.1\r]>").is_err());
+        assert!(parse("<user@[a b]>").is_err());
+        assert!(parse("<user@[\u{0}]>").is_err());
+        assert!(parse("<user@[IPv6:::1]>").is_err());
+        assert!(parse("<user@[192.0.2.1>").is_err());
     }
 
     #[test]
