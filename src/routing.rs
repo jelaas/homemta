@@ -582,7 +582,8 @@ fn drain_capped(mut r: impl Read, cap: u64) -> (Vec<u8>, u64) {
     let mut kept = Vec::new();
     let _ = (&mut r).take(cap).read_to_end(&mut kept);
     let extra = std::io::copy(&mut r, &mut std::io::sink()).unwrap_or(0);
-    (kept, kept.len() as u64 + extra)
+    let total = kept.len() as u64 + extra;
+    (kept, total)
 }
 
 fn deliver_pipe(cmd: &str, sender: &str, rcpt_full: &str, msg: &[u8]) -> Result<(), String> {
